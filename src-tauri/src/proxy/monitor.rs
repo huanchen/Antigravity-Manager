@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use tokio::sync::RwLock;
 
+const DB_LOG_RETENTION_DAYS: i64 = 7;
+const DB_MAX_LOG_ROWS: usize = 20_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
     pub id: String,
@@ -47,16 +50,36 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::spawn(async {
-            match crate::modules::proxy_db::cleanup_old_logs(30) {
+        // Auto cleanup old logs without blocking the async runtime. Do not VACUUM
+        // here; compaction is handled operationally when the service is stopped.
+        tokio::task::spawn_blocking(|| {
+            match crate::modules::proxy_db::cleanup_old_logs(DB_LOG_RETENTION_DAYS) {
                 Ok(deleted) => {
                     if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+                        tracing::info!(
+                            "Auto cleanup: removed {} old proxy logs (>{} days)",
+                            deleted,
+                            DB_LOG_RETENTION_DAYS
+                        );
                     }
                 }
                 Err(e) => {
                     tracing::error!("Failed to cleanup old logs: {}", e);
+                }
+            }
+
+            match crate::modules::proxy_db::limit_max_logs(DB_MAX_LOG_ROWS) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            "Auto cleanup: trimmed {} proxy logs beyond newest {} rows",
+                            deleted,
+                            DB_MAX_LOG_ROWS
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to trim proxy logs: {}", e);
                 }
             }
         });
@@ -84,7 +107,7 @@ impl ProxyMonitor {
         {
             let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
             let account = account.clone();
-            tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
                 if let Err(e) =
                     crate::modules::token_stats::record_usage(&account, &model, input, output)
                 {
@@ -119,7 +142,7 @@ impl ProxyMonitor {
 
         // Save to DB
         let log_to_save = log.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
                 tracing::error!("Failed to save proxy log to DB: {}", e);
             }
@@ -146,22 +169,6 @@ impl ProxyMonitor {
                 }
             }
 
-            // Record token stats if available
-            if let (Some(account), Some(input), Some(output)) = (
-                &log_to_save.account_email,
-                log_to_save.input_tokens,
-                log_to_save.output_tokens,
-            ) {
-                let model = log_to_save
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                if let Err(e) =
-                    crate::modules::token_stats::record_usage(account, &model, input, output)
-                {
-                    tracing::debug!("Failed to record token stats: {}", e);
-                }
-            }
         });
 
         // Emit event (send summary only, without body to reduce memory)

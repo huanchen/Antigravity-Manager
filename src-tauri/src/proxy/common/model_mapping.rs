@@ -20,31 +20,12 @@ pub fn update_dynamic_forwarding_rules(old_model: String, new_model: String) {
 static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
-    // 直接支持的模型
+    // Antigravity upstream currently exposes exactly these Claude model IDs.
+    // Keep route catalog aligned with upstream; legacy Claude IDs should not
+    // participate in quota detection or account scheduling.
     m.insert("claude-sonnet-4-6", "claude-sonnet-4-6");
-    m.insert("claude-sonnet-4-6-thinking", "claude-sonnet-4-6-thinking");
-
-    // [Redirect] Sonnet 4.5 -> Sonnet 4.6
-    m.insert("claude-sonnet-4-5", "claude-sonnet-4-6");
-    m.insert("claude-sonnet-4-5-thinking", "claude-sonnet-4-6-thinking");
-
-    // 别名映射
-    m.insert("claude-sonnet-4-5-20250929", "claude-sonnet-4-6-thinking");
-    m.insert("claude-3-5-sonnet-20241022", "claude-sonnet-4-6");
-    m.insert("claude-3-5-sonnet-20240620", "claude-sonnet-4-6");
-    // [Redirect] Opus 4.5 -> Opus 4.6 (Issue #1743)
-    m.insert("claude-opus-4", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-5-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-5-20251101", "claude-opus-4-6-thinking");
-
-    // Claude Opus 4.6
     m.insert("claude-opus-4-6-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-6", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-6-20260201", "claude-opus-4-6-thinking");
 
-    m.insert("claude-haiku-4", "claude-sonnet-4-6");
-    m.insert("claude-3-haiku-20240307", "claude-sonnet-4-6");
-    m.insert("claude-haiku-4-5-20251001", "claude-sonnet-4-6");
     // OpenAI 协议映射表
     m.insert("gpt-4", "gemini-2.5-flash");
     m.insert("gpt-4-turbo", "gemini-2.5-flash");
@@ -83,6 +64,7 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("gemini-2.5-flash", "gemini-2.5-flash");
     m.insert("gemini-3-flash", "gemini-3-flash");
     m.insert("gemini-3-pro-image", "gemini-3-pro-image");
+    m.insert("gemini-3.1-flash-image", "gemini-3.1-flash-image");
 
     // [New] Unified Virtual ID for Background Tasks (Title, Summary, etc.)
     // Allows users to override all background tasks via custom_mapping
@@ -91,45 +73,79 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m
 });
 
-/// Map Claude model names to Gemini model names
-///
-/// # 映射策略
-/// 1. **精确匹配**: 检查 CLAUDE_TO_GEMINI 映射表
-/// 2. **已知前缀透传**: gemini-* 和 *-thinking 模型直接透传
-/// 3. **[NEW] 直接透传**: 未知模型 ID 直接传递给 Google API (支持体验未发布模型)
-///
-/// # 参数
-/// - `input`: 原始模型名称
-///
-/// # 返回
-/// 映射后的目标模型名称
-///
-/// # 示例
-/// ```
-/// // 精确匹配
-/// assert_eq!(map_claude_model_to_gemini("claude-opus-4"), "claude-opus-4-5-thinking");
-///
-/// // Gemini 模型透传
-/// assert_eq!(map_claude_model_to_gemini("gemini-2.5-flash"), "gemini-2.5-flash");
-///
-/// // 直接透传未知模型 (NEW!)
-/// assert_eq!(map_claude_model_to_gemini("claude-opus-4-6"), "claude-opus-4-6");
-/// assert_eq!(map_claude_model_to_gemini("claude-sonnet-5"), "claude-sonnet-5");
-/// ```
+pub const SUPPORTED_CLAUDE_MODELS: [&str; 2] =
+    ["claude-sonnet-4-6", "claude-opus-4-6-thinking"];
+
+/// Canonicalize Claude aliases only when they point at an upstream-supported
+/// Antigravity Claude model. Older Claude model families intentionally return
+/// None because the upstream quota catalog does not expose them.
+pub fn canonical_supported_claude_model(model_name: &str) -> Option<&'static str> {
+    let lower = model_name
+        .trim()
+        .trim_start_matches("models/")
+        .to_lowercase();
+
+    match lower.as_str() {
+        "claude-sonnet-4-6" => Some("claude-sonnet-4-6"),
+        // Compatibility for clients that add a synthetic thinking suffix.
+        "claude-sonnet-4-6-thinking" => Some("claude-sonnet-4-6"),
+        "claude-opus-4-6-thinking" => Some("claude-opus-4-6-thinking"),
+        // Compatibility for clients that omit the upstream thinking suffix.
+        "claude-opus-4-6" => Some("claude-opus-4-6-thinking"),
+        _ => None,
+    }
+}
+
+pub fn is_supported_claude_model(model_name: &str) -> bool {
+    canonical_supported_claude_model(model_name).is_some()
+}
+
+pub fn is_legacy_claude_group(model_name: &str) -> bool {
+    matches!(
+        model_name.trim().to_lowercase().as_str(),
+        "claude" | "claude-sonnet" | "claude-opus"
+    )
+}
+
+pub fn expand_legacy_claude_group(model_name: &str) -> Vec<String> {
+    if is_legacy_claude_group(model_name) {
+        SUPPORTED_CLAUDE_MODELS
+            .iter()
+            .map(|m| (*m).to_string())
+            .collect()
+    } else {
+        vec![model_name.to_string()]
+    }
+}
+
+pub fn protected_model_matches(protected_models: &std::collections::HashSet<String>, target: &str) -> bool {
+    if protected_models.contains(target) {
+        return true;
+    }
+
+    // Backward compatibility: old configs persisted "claude" as a single
+    // protected group. Limit that compatibility to the two supported Claude IDs.
+    protected_models.contains("claude") && is_supported_claude_model(target)
+}
+
+/// Map incoming model names to Antigravity upstream model names.
 pub fn map_claude_model_to_gemini(input: &str) -> String {
     // 1. Check exact match in map
     if let Some(mapped) = CLAUDE_TO_GEMINI.get(input) {
         return mapped.to_string();
     }
 
-    // 2. Pass-through known prefixes (gemini-, -thinking) to support dynamic suffixes
-    if input.starts_with("gemini-") || input.contains("thinking") {
+    // 2. Canonicalize only aliases for models Antigravity actually exposes.
+    if let Some(mapped) = canonical_supported_claude_model(input) {
+        return mapped.to_string();
+    }
+
+    // 3. Pass-through known Gemini prefixes to support dynamic suffixes.
+    if input.starts_with("gemini-") {
         return input.to_string();
     }
 
-    // 3. [ENHANCED] 直接透传未知模型 ID,而不是强制 fallback
-    // 这允许用户通过自定义映射体验未发布的模型 (如 claude-opus-4-6)
-    // Google API 会自动处理无效模型并返回错误,用户可以根据错误调整映射
+    // Unknown models pass through so custom mapping can still override them.
     input.to_string()
 }
 
@@ -308,20 +324,20 @@ pub fn resolve_model_route(
     result
 }
 
-/// Normalize any physical model name to one of the 3 standard protection IDs.
-/// This ensures quota protection works consistently regardless of API versioning or request variations.
-///
-/// Standard IDs:
-/// - `gemini-3-flash`: All Flash variants (1.5-flash, 2.5-flash, 3-flash, etc.)
-/// - `gemini-3-pro-high`: All Pro variants (1.5-pro, 2.5-pro, etc.)
-/// - `claude-sonnet-4-5`: All Claude Sonnet variants (3-5-sonnet, sonnet-4-5, etc.)
-///
-/// Returns `None` if the model doesn't match any of the 3 protected categories.
+pub fn is_image_generation_model(model_name: &str) -> bool {
+    let lower = model_name.trim().to_lowercase();
+    lower.contains("image") || lower.contains("imagen")
+}
+
+/// Normalize a physical model name to the key used for quota/rate-limit/protection.
+/// Claude is intentionally exact: only upstream-supported Antigravity Claude
+/// model IDs are normalized, preventing unsupported Claude families from
+/// poisoning Sonnet/Opus availability.
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
     // 1. image 资源 (优先匹配，使用 contains 匹配以支持任何变体，如 gemini-3.1-flash-image)
-    if lower.contains("image") {
+    if is_image_generation_model(&lower) {
         return Some("gemini-3-pro-image".to_string());
     }
 
@@ -335,13 +351,9 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
         return Some("gemini-3-pro-high".to_string());
     }
 
-    // 4. Claude 系列 (合并 Opus, Sonnet, Haiku 为统一保护组 'claude')
-    if lower.contains("claude")
-        || lower.contains("opus")
-        || lower.contains("sonnet")
-        || lower.contains("haiku")
-    {
-        return Some("claude".to_string());
+    // 4. Claude: keep exact upstream support boundaries.
+    if let Some(canonical) = canonical_supported_claude_model(&lower) {
+        return Some(canonical.to_string());
     }
 
     None
@@ -354,21 +366,16 @@ mod tests {
     #[test]
     fn test_model_mapping() {
         assert_eq!(
-            map_claude_model_to_gemini("claude-3-5-sonnet-20241022"),
-            "claude-sonnet-4-6"
-        );
-        // [Redirect] Sonnet 4.5 -> Sonnet 4.6
-        assert_eq!(
-            map_claude_model_to_gemini("claude-sonnet-4-5"),
+            map_claude_model_to_gemini("claude-sonnet-4-6-thinking"),
             "claude-sonnet-4-6"
         );
         assert_eq!(
-            map_claude_model_to_gemini("claude-sonnet-4-5-thinking"),
-            "claude-sonnet-4-6-thinking"
-        );
-        assert_eq!(
-            map_claude_model_to_gemini("claude-opus-4"),
+            map_claude_model_to_gemini("claude-opus-4-6"),
             "claude-opus-4-6-thinking"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("claude-3-5-sonnet-20241022"),
+            "claude-3-5-sonnet-20241022"
         );
         // Test gemini pass-through (should not be caught by "mini" rule)
         assert_eq!(
@@ -403,14 +410,18 @@ mod tests {
             "gemini-3.1-pro-preview"
         );
 
-        // Test Normalization (Opus 4.6 now merged into "claude" group)
+        // Claude normalization is exact to upstream support.
         assert_eq!(
             normalize_to_standard_id("claude-opus-4-6-thinking"),
-            Some("claude".to_string())
+            Some("claude-opus-4-6-thinking".to_string())
+        );
+        assert_eq!(
+            normalize_to_standard_id("claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
             normalize_to_standard_id("claude-sonnet-4-5"),
-            Some("claude".to_string())
+            None
         );
 
         // [Regression] gemini-3-pro-image must NOT be grouped with gemini-3-pro-high

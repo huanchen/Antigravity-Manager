@@ -26,7 +26,11 @@ use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
-use std::sync::{atomic::Ordering, Arc}; // [NEW]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+}; // [NEW]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
@@ -160,7 +164,74 @@ fn apply_thinking_hints(
     }
 }
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+const MAX_RETRY_ATTEMPTS: usize = 20;
+const OPUS_FAST_RETRY_MAX_ATTEMPTS: usize = 4;
+const OPUS_429_FAST_RETRY_MAX_ATTEMPTS: usize = 3;
+const OPUS_FAST_RETRY_DELAY_MS: u64 = 200;
+const OPUS_FALLBACK_MODEL: &str = "claude-sonnet-4-6";
+const OPUS_FALLBACK_CAPACITY_COOLDOWN_SECS: u64 = 60;
+const OPUS_FALLBACK_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
+
+static OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn is_opus_46_thinking_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude-opus-4-6") && model.contains("thinking")
+}
+
+fn is_opus_fast_fail_status(status_code: u16) -> bool {
+    matches!(status_code, 429 | 503 | 529)
+}
+
+fn opus_fast_retry_limit(status_code: u16, max_attempts: usize) -> usize {
+    let cap = if status_code == 429 {
+        OPUS_429_FAST_RETRY_MAX_ATTEMPTS
+    } else {
+        OPUS_FAST_RETRY_MAX_ATTEMPTS
+    };
+    max_attempts.min(cap).max(1)
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn opus_to_sonnet_fallback_remaining_secs() -> u64 {
+    let now = unix_now_secs();
+    OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH
+        .load(Ordering::Relaxed)
+        .saturating_sub(now)
+}
+
+fn activate_opus_to_sonnet_fallback(status_code: u16) -> u64 {
+    let cooldown_secs = if status_code == 429 {
+        OPUS_FALLBACK_RATE_LIMIT_COOLDOWN_SECS
+    } else {
+        OPUS_FALLBACK_CAPACITY_COOLDOWN_SECS
+    };
+    let now = unix_now_secs();
+    let until = now.saturating_add(cooldown_secs);
+    let mut current = OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH.load(Ordering::Relaxed);
+
+    while until > current {
+        match OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH.compare_exchange(
+            current,
+            until,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+
+    OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH
+        .load(Ordering::Relaxed)
+        .saturating_sub(now)
+}
 
 // ===== Model Constants for Background Tasks =====
 // These can be adjusted for performance/cost optimization or overridden by custom_mapping
@@ -575,22 +646,48 @@ pub async fn handle_messages(
     let token_manager = state.token_manager;
 
     let pool_size = token_manager.len();
+    let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &request_for_body.model,
+        &*state.custom_mapping.read().await,
+    );
+    let is_initial_opus_46 = is_opus_46_thinking_model(&initial_mapped_model);
     // [FIX] Ensure max_attempts is at least 2 to allow for internal retries (e.g. stripping signatures)
     // even if the user has only 1 account.
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let base_max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let max_attempts = if is_initial_opus_46 {
+        MAX_RETRY_ATTEMPTS.min(base_max_attempts.saturating_add(1))
+    } else {
+        base_max_attempts
+    };
 
     let mut last_error = String::new();
-    let retried_without_thinking = false;
+    let mut retried_without_thinking = false;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
-        let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let resolved_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
         );
+        let fallback_remaining = if is_opus_46_thinking_model(&resolved_mapped_model) {
+            opus_to_sonnet_fallback_remaining_secs()
+        } else {
+            0
+        };
+        let mut mapped_model = if fallback_remaining > 0 {
+            tracing::warn!(
+                "[{}] Opus 4.6 thinking is in fallback cooldown ({}s remaining); routing to {}",
+                trace_id,
+                fallback_remaining,
+                OPUS_FALLBACK_MODEL
+            );
+            OPUS_FALLBACK_MODEL.to_string()
+        } else {
+            resolved_mapped_model
+        };
         last_mapped_model = Some(mapped_model.clone());
 
         // 将 Claude 工具转为 Value 数组以便探测联网
@@ -633,6 +730,21 @@ pub async fn handle_messages(
                 } else {
                     e
                 };
+                last_error = format!("No available accounts: {}", safe_message);
+                last_status = StatusCode::SERVICE_UNAVAILABLE;
+
+                if is_opus_46_thinking_model(&mapped_model) && attempt + 1 < max_attempts {
+                    let cooldown_secs = activate_opus_to_sonnet_fallback(503);
+                    tracing::warn!(
+                        "[{}] Opus 4.6 thinking account selection failed: {}. Falling back to {} for this request; cooldown={}s",
+                        trace_id,
+                        safe_message,
+                        OPUS_FALLBACK_MODEL,
+                        cooldown_secs
+                    );
+                    continue;
+                }
+
                 let headers = [("X-Mapped-Model", mapped_model.as_str())];
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1424,7 +1536,8 @@ pub async fn handle_messages(
                 || error_text.contains("must be `thinking`")
                 || error_text.contains("must be 'thinking'"))
         {
-            // Existing logic for thinking signature...\n            retried_without_thinking = true;
+            // Existing logic for thinking signature...
+            retried_without_thinking = true;
 
             // 使用 WARN 级别,因为这不应该经常发生(已经主动过滤过)
             tracing::warn!(
@@ -1557,12 +1670,77 @@ pub async fn handle_messages(
             }
         }
 
+        if is_opus_46_thinking_model(&request_with_mapped.model)
+            && is_opus_fast_fail_status(status_code)
+        {
+            let opus_attempt_budget = if is_initial_opus_46 {
+                max_attempts.saturating_sub(1).max(1)
+            } else {
+                max_attempts
+            };
+            let fast_limit = opus_fast_retry_limit(status_code, opus_attempt_budget);
+            if attempt + 1 < fast_limit {
+                tracing::warn!(
+                    "[{}] Opus 4.6 thinking hit upstream capacity/rate limit (status={}) on attempt {}/{}; rotating quickly after {}ms",
+                    trace_id,
+                    status_code,
+                    attempt + 1,
+                    fast_limit,
+                    OPUS_FAST_RETRY_DELAY_MS
+                );
+                tokio::time::sleep(Duration::from_millis(OPUS_FAST_RETRY_DELAY_MS)).await;
+                continue;
+            }
+
+            let cooldown_secs = activate_opus_to_sonnet_fallback(status_code);
+            if attempt + 1 < max_attempts {
+                tracing::warn!(
+                    "[{}] Opus 4.6 thinking hit status={} after {} fast attempts. Falling back to {} for this request; cooldown={}s. Last error: {}",
+                    trace_id,
+                    status_code,
+                    fast_limit,
+                    OPUS_FALLBACK_MODEL,
+                    cooldown_secs,
+                    last_error
+                );
+                tokio::time::sleep(Duration::from_millis(OPUS_FAST_RETRY_DELAY_MS)).await;
+                continue;
+            }
+
+            let error_type = if status_code == 429 {
+                "rate_limit_error"
+            } else {
+                "overloaded_error"
+            };
+            let message = format!(
+                "claude-opus-4-6-thinking upstream returned HTTP {} across {} fast attempts; stopped without long retry backoff. Last error: {}",
+                status_code, fast_limit, last_error
+            );
+
+            tracing::warn!("[{}] {}", trace_id, message);
+            return (
+                status,
+                [
+                    ("X-Account-Email", email.as_str()),
+                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                ],
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "id": "err_opus_capacity_fast_fail",
+                        "type": error_type,
+                        "message": message
+                    }
+                })),
+            )
+                .into_response();
+        }
+
         // 确定重试策略
         let retry_strategy =
             determine_retry_strategy(status_code, &error_text, retried_without_thinking);
 
         // 执行退避
-        let mut force_rotate = false;
         if apply_retry_strategy(
             retry_strategy.clone(),
             attempt,
@@ -1578,9 +1756,11 @@ pub async fn handle_messages(
                     "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
                     trace_id, status_code
                 );
-                force_rotate = false;
             } else {
-                force_rotate = true;
+                debug!(
+                    "[{}] Rotating account for retry after status {}",
+                    trace_id, status_code
+                );
             }
             continue;
         } else {

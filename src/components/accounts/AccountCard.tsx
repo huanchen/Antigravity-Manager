@@ -34,6 +34,7 @@ const DEFAULT_MODELS = Object.entries(MODEL_CONFIG).map(([id, config]) => ({
     protectedKey: config.protectedKey,
     Icon: config.Icon
 }));
+const SUPPORTED_CLAUDE_MODELS = new Set(['claude-sonnet-4-6', 'claude-opus-4-6-thinking']);
 
 function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, isRefreshing, isSwitching = false, onSwitch, onRefresh, onViewDetails, onExport, onDelete, onToggleProxy, onViewDevice, onWarmup, onUpdateLabel, onViewError }: AccountCardProps) {
     const { t } = useTranslation();
@@ -103,8 +104,11 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
             }
         }
 
-        // 应用排序并过滤过期模型
-        return sortModels(models).filter(m => m.id !== 'claude-sonnet-4-6-thinking' && m.id !== 'claude-sonnet-4-5-thinking' && m.id !== 'claude-opus-4-5-thinking');
+        // 应用排序并过滤非上游支持的 Claude 模型
+        return sortModels(models).filter(m => {
+            const id = m.id.toLowerCase();
+            return !id.startsWith('claude-') || SUPPORTED_CLAUDE_MODELS.has(id);
+        });
     }, [config, account, showAllQuotas]);
 
     const isModelProtected = (key?: string) => {

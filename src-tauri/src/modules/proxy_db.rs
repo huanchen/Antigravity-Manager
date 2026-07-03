@@ -2,9 +2,34 @@ use crate::proxy::monitor::ProxyRequestLog;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
+const MAX_LOG_BODY_BYTES: usize = 64 * 1024;
+const MAX_LOG_ERROR_BYTES: usize = 16 * 1024;
+const SQLITE_BUSY_TIMEOUT_MS: i64 = 15_000;
+const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
     Ok(data_dir.join("proxy_logs.db"))
+}
+
+fn truncate_text(value: &Option<String>, max_bytes: usize, field_name: &str) -> Option<String> {
+    let text = value.as_ref()?;
+    if text.len() <= max_bytes {
+        return Some(text.clone());
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    Some(format!(
+        "{}\n...[{} truncated: original_bytes={}, stored_bytes={}]",
+        &text[..end],
+        field_name,
+        text.len(),
+        end
+    ))
 }
 
 fn connect_db() -> Result<Connection, String> {
@@ -15,13 +40,20 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
 
-    // Set busy timeout to 5000ms to avoid "database is locked" errors
-    conn.pragma_update(None, "busy_timeout", 5000)
+    // Give concurrent readers/writers a short window instead of failing immediately.
+    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
         .map_err(|e| e.to_string())?;
 
     // Synchronous NORMAL is faster and safe enough for WAL
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
+
+    conn.pragma_update(
+        None,
+        "journal_size_limit",
+        SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(conn)
 }
@@ -80,6 +112,9 @@ pub fn init_db() -> Result<(), String> {
 
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
+    let request_body = truncate_text(&log.request_body, MAX_LOG_BODY_BYTES, "request_body");
+    let response_body = truncate_text(&log.response_body, MAX_LOG_BODY_BYTES, "response_body");
+    let error = truncate_text(&log.error, MAX_LOG_ERROR_BYTES, "error");
 
     conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, account_email, mapped_model, protocol, client_ip, username)
@@ -92,9 +127,9 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.status,
             log.duration,
             log.model,
-            log.error,
-            log.request_body,
-            log.response_body,
+            error,
+            request_body,
+            response_body,
             log.input_tokens,
             log.output_tokens,
             log.account_email,
@@ -225,7 +260,7 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
     let conn = connect_db()?;
 
-    let cutoff_timestamp = chrono::Utc::now().timestamp() - (days * 24 * 3600);
+    let cutoff_timestamp = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
 
     let deleted = conn
         .execute(
@@ -233,9 +268,6 @@ pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
             [cutoff_timestamp],
         )
         .map_err(|e| e.to_string())?;
-
-    // Execute VACUUM to reclaim disk space
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
 
     Ok(deleted)
 }
@@ -253,8 +285,6 @@ pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
             [max_count],
         )
         .map_err(|e| e.to_string())?;
-
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
 
     Ok(deleted)
 }

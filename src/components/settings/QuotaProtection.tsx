@@ -8,14 +8,16 @@ interface QuotaProtectionProps {
     onChange: (config: QuotaProtectionConfig) => void;
 }
 
+const SUPPORTED_CLAUDE_MODELS = new Set(['claude-sonnet-4-6', 'claude-opus-4-6-thinking']);
+
 const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
     const { t } = useTranslation();
 
     const handleEnabledChange = (enabled: boolean) => {
         let newConfig = { ...config, enabled };
-        // 如果开启保护且勾选列表为空，则默认勾选 claude
+        // 如果开启保护且勾选列表为空，则默认勾选上游支持的 Claude 模型
         if (enabled && (!config.monitored_models || config.monitored_models.length === 0)) {
-            newConfig.monitored_models = ['claude'];
+            newConfig.monitored_models = Array.from(SUPPORTED_CLAUDE_MODELS);
         }
         onChange(newConfig);
     };
@@ -44,7 +46,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
     const uniqueLabels = new Set<string>();
     const monitoredModelsOptions = Object.entries(MODEL_CONFIG)
         .filter(([id, config]) => {
-            if (id.includes('thinking')) return false;
+            if (id.startsWith('claude-') && !SUPPORTED_CLAUDE_MODELS.has(id)) return false;
             const label = config.shortLabel || config.label;
             if (uniqueLabels.has(label)) return false;
             uniqueLabels.add(label);

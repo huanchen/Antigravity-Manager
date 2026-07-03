@@ -26,6 +26,7 @@ dist
 *.sw?
 
 # Build output
+src-tauri/target
 src-tauri/target/
 src-tauri/gen/
 src-tauri/.env

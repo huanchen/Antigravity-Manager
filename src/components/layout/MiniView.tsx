@@ -147,8 +147,8 @@ export default function MiniView() {
     const geminiFlashModel = currentAccount?.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-flash');
 
     const claudeGroupNames = [
-        'claude-opus-4-6-thinking',
-        'claude'
+        'claude-sonnet-4-6',
+        'claude-opus-4-6-thinking'
     ];
     const claudeModel = currentAccount?.quota?.models
         .filter(m => claudeGroupNames.includes(m.name.toLowerCase()))

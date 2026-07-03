@@ -6,8 +6,106 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, info};
+
+// ===== Image generation account controls =====
+
+pub const IMAGE_PER_ACCOUNT_CONCURRENCY: usize = 2;
+const DEFAULT_IMAGE_GLOBAL_CONCURRENCY: usize = 48;
+const DEFAULT_IMAGE_GLOBAL_QUEUE_WAIT_MS: u64 = 300_000;
+static IMAGE_ACCOUNT_PERMITS: std::sync::OnceLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Semaphore>>,
+> = std::sync::OnceLock::new();
+static IMAGE_GLOBAL_PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+pub fn image_max_attempts(pool_size: usize) -> usize {
+    // Image models are not uniformly exposed across accounts. Try the whole pool so
+    // unsupported accounts do not cause an early failure after the generic 3 attempts.
+    pool_size.max(1)
+}
+
+pub fn is_retryable_image_error(status_code: u16, error_text: &str) -> bool {
+    match status_code {
+        // Account/model-specific failures should rotate accounts. Upstream 5xx means
+        // Google capacity is unhealthy and should fail fast instead of fanning out.
+        401 | 403 | 404 | 429 => true,
+        400 => {
+            let lower = error_text.to_lowercase();
+            lower.contains("not supported")
+                || lower.contains("unsupported")
+                || lower.contains("does not support")
+                || lower.contains("not available")
+                || lower.contains("model not found")
+                || lower.contains("model is not found")
+        }
+        _ => false,
+    }
+}
+
+fn image_global_concurrency_limit() -> usize {
+    std::env::var("ABV_IMAGE_GLOBAL_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_IMAGE_GLOBAL_CONCURRENCY)
+}
+
+fn image_global_queue_wait_ms() -> u64 {
+    std::env::var("ABV_IMAGE_GLOBAL_QUEUE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_IMAGE_GLOBAL_QUEUE_WAIT_MS)
+}
+
+pub async fn acquire_global_image_permit() -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    let semaphore = IMAGE_GLOBAL_PERMITS
+        .get_or_init(|| {
+            let limit = image_global_concurrency_limit();
+            info!(
+                "[Images] Global image concurrency limit: {}, queue_wait={}ms",
+                limit,
+                image_global_queue_wait_ms()
+            );
+            std::sync::Arc::new(tokio::sync::Semaphore::new(limit))
+        })
+        .clone();
+    let wait_ms = image_global_queue_wait_ms();
+
+    match timeout(Duration::from_millis(wait_ms), semaphore.acquire_owned()).await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err("Image concurrency limiter closed".to_string()),
+        Err(_) => Err(format!(
+            "Image concurrency queue timeout (limit={}, waited={}ms)",
+            image_global_concurrency_limit(),
+            wait_ms
+        )),
+    }
+}
+
+pub async fn acquire_image_account_permit(
+    account_id: &str,
+) -> tokio::sync::OwnedSemaphorePermit {
+    let semaphore = {
+        let entry = IMAGE_ACCOUNT_PERMITS
+            .get_or_init(dashmap::DashMap::new)
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    IMAGE_PER_ACCOUNT_CONCURRENCY,
+                ))
+            });
+        entry.value().clone()
+    };
+
+    semaphore
+        .acquire_owned()
+        .await
+        .expect("image account semaphore closed unexpectedly")
+}
 
 // ===== 统一重试与退避策略 =====
 

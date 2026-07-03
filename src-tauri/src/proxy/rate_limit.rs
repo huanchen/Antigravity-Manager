@@ -104,7 +104,17 @@ impl RateLimitTracker {
     /// 当账号成功完成请求后调用此方法，将其失败计数归零，
     /// 这样下次失败时会从最短的锁定时间（60秒）开始。
     pub fn mark_success(&self, account_id: &str) {
-        if self.failure_counts.remove(account_id).is_some() {
+        let prefix = format!("{}:", account_id);
+        let mut removed_failure_count = self.failure_counts.remove(account_id).is_some();
+        self.failure_counts.retain(|key, _| {
+            let keep = !key.starts_with(&prefix);
+            if !keep {
+                removed_failure_count = true;
+            }
+            keep
+        });
+
+        if removed_failure_count {
             tracing::debug!("账号 {} 请求成功，已重置失败计数", account_id);
         }
         // 清除账号级限流
@@ -224,7 +234,12 @@ impl RateLimitTracker {
             );
             RateLimitReason::ServerError
         } else {
-            RateLimitReason::ServerError
+            let parsed = self.parse_rate_limit_reason(body);
+            if matches!(parsed, RateLimitReason::ModelCapacityExhausted) {
+                parsed
+            } else {
+                RateLimitReason::ServerError
+            }
         };
 
         let mut retry_after_sec = None;
@@ -257,13 +272,19 @@ impl RateLimitTracker {
                 let failure_count = if reason != RateLimitReason::ServerError {
                     // 只有非 ServerError 才累加失败计数（用于指数退避）
                     let now = SystemTime::now();
-                    // 这里我们使用 account_id 作为 key，不区分模型，
-                    // 因为这里是为了计算连续"账号级"问题的退避。
-                    // 如果需要针对模型的连续失败计数，可能需要改变 failure_counts 的 key。
-                    // 暂时保持 account_id，这样如果一个模型一直挂，也会增加计数，符合逻辑。
+                    let base_failure_key = if matches!(
+                        reason,
+                        RateLimitReason::QuotaExhausted | RateLimitReason::ModelCapacityExhausted
+                    ) && model.is_some()
+                    {
+                        self.get_limit_key(account_id, model.as_deref())
+                    } else {
+                        account_id.to_string()
+                    };
+                    let failure_key = format!("{}:{:?}", base_failure_key, reason);
                     let mut entry = self
                         .failure_counts
-                        .entry(account_id.to_string())
+                        .entry(failure_key.clone())
                         .or_insert((0, now));
 
                     let elapsed = now
@@ -272,8 +293,8 @@ impl RateLimitTracker {
                         .as_secs();
                     if elapsed > FAILURE_COUNT_EXPIRY_SECONDS {
                         tracing::debug!(
-                            "账号 {} 失败计数已过期（{}秒），重置为 0",
-                            account_id,
+                            "限流 Key {} 失败计数已过期（{}秒），重置为 0",
+                            failure_key,
                             elapsed
                         );
                         *entry = (0, now);
@@ -344,15 +365,17 @@ impl RateLimitTracker {
             model: model.clone(),
         };
 
-        // [FIX] 使用复合 Key 存储 (如果是 Quota 且有 Model)
-        // 只有 QuotaExhausted 适合做模型隔离，其他如 RateLimitExceeded 通常是全账号的 TPM
-        let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
+        // [FIX] 使用复合 Key 存储 (如果是模型相关问题且有 Model)
+        // QuotaExhausted 与 ModelCapacityExhausted 都应做模型隔离，避免 Opus 问题误伤 Sonnet。
+        let use_model_key = matches!(
+            reason,
+            RateLimitReason::QuotaExhausted | RateLimitReason::ModelCapacityExhausted
+        ) && model.is_some();
         let key = if use_model_key {
             self.get_limit_key(account_id, model.as_deref())
         } else {
             // 其他情况（如 RateLimitExceeded, ServerError）通常影响整个账号
             // 或者我们也可以根据配置决定是否隔离。
-            // 简单起见，只有 QuotaExhausted 做细粒度隔离。
             account_id.to_string()
         };
 
@@ -397,6 +420,12 @@ impl RateLimitTracker {
                     .and_then(|v| v.as_str())
                 {
                     let msg_lower = msg.to_lowercase();
+                    if msg_lower.contains("model_capacity_exhausted")
+                        || msg_lower.contains("model capacity")
+                        || msg_lower.contains("no capacity available")
+                    {
+                        return RateLimitReason::ModelCapacityExhausted;
+                    }
                     if msg_lower.contains("per minute") || msg_lower.contains("rate limit") {
                         return RateLimitReason::RateLimitExceeded;
                     }
@@ -407,7 +436,12 @@ impl RateLimitTracker {
         // 如果无法从 JSON 解析，尝试从消息文本判断
         let body_lower = body.to_lowercase();
         // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
-        if body_lower.contains("per minute")
+        if body_lower.contains("model_capacity_exhausted")
+            || body_lower.contains("model capacity")
+            || body_lower.contains("no capacity available")
+        {
+            RateLimitReason::ModelCapacityExhausted
+        } else if body_lower.contains("per minute")
             || body_lower.contains("rate limit")
             || body_lower.contains("too many requests")
         {
@@ -595,6 +629,16 @@ impl RateLimitTracker {
         }
     }
 
+    /// 获取账号级或指定模型级限流距离重置的秒数。
+    pub fn get_reset_seconds_for(&self, account_id: &str, model: Option<&str>) -> Option<u64> {
+        let wait = self.get_remaining_wait(account_id, model);
+        if wait > 0 {
+            Some(wait)
+        } else {
+            None
+        }
+    }
+
     /// 清除过期的限流记录
     #[allow(dead_code)]
     pub fn cleanup_expired(&self) -> usize {
@@ -706,6 +750,72 @@ mod tests {
         let reason = tracker.parse_rate_limit_reason(body);
         // 应该被识别为 RateLimitExceeded，而不是 QuotaExhausted
         assert_eq!(reason, RateLimitReason::RateLimitExceeded);
+    }
+
+    #[test]
+    fn test_503_model_capacity_is_model_scoped() {
+        let tracker = RateLimitTracker::new();
+        let backoff_steps = vec![60, 300, 1800, 7200];
+        let body = r#"{"error":{"details":[{"reason":"MODEL_CAPACITY_EXHAUSTED"}],"message":"No capacity available for model claude-opus-4-6-thinking on the server"}}"#;
+
+        let info = tracker.parse_from_error(
+            "acc_opus",
+            503,
+            None,
+            body,
+            Some("claude-opus-4-6-thinking".to_string()),
+            &backoff_steps,
+        );
+
+        let info = info.expect("503 model capacity should create a short model lock");
+        assert_eq!(info.reason, RateLimitReason::ModelCapacityExhausted);
+        assert_eq!(info.retry_after_sec, 5);
+        assert!(tracker.get_remaining_wait("acc_opus", Some("claude-opus-4-6-thinking")) > 0);
+        assert_eq!(
+            tracker.get_remaining_wait("acc_opus", Some("claude-sonnet-4-6")),
+            0,
+            "Opus capacity lock must not block Sonnet on the same account"
+        );
+        assert_eq!(
+            tracker.get_remaining_wait("acc_opus", None),
+            0,
+            "Opus capacity lock must not become an account-level lock"
+        );
+    }
+
+    #[test]
+    fn test_model_capacity_does_not_pollute_quota_backoff() {
+        let tracker = RateLimitTracker::new();
+        let backoff_steps = vec![60, 300, 1800, 7200];
+        let capacity_body =
+            r#"{"error":{"details":[{"reason":"MODEL_CAPACITY_EXHAUSTED"}]}}"#;
+        let quota_body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+
+        for _ in 0..3 {
+            tracker.parse_from_error(
+                "acc_mixed",
+                503,
+                None,
+                capacity_body,
+                Some("claude-opus-4-6-thinking".to_string()),
+                &backoff_steps,
+            );
+        }
+
+        let info = tracker.parse_from_error(
+            "acc_mixed",
+            429,
+            None,
+            quota_body,
+            Some("claude-opus-4-6-thinking".to_string()),
+            &backoff_steps,
+        );
+
+        assert_eq!(
+            info.unwrap().retry_after_sec,
+            60,
+            "Quota backoff should start from the first quota failure, not inherit capacity failures"
+        );
     }
 
     #[test]

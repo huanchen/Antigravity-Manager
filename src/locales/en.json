@@ -729,7 +729,7 @@
                     "to_label": "z.ai model",
                     "add_rule": "Add",
                     "empty": "No override rules configured.",
-                    "from_placeholder": "From (e.g. claude-3-opus)",
+                    "from_placeholder": "From (e.g. claude-opus-4-6)",
                     "to_placeholder": "To (e.g. glm-4)"
                 },
                 "modes": {
@@ -979,7 +979,7 @@
         },
         "router": {
             "title": "Model Router",
-            "subtitle": "Route models by series or add custom exact mappings.\nNote: Native Claude pass-through models (e.g. claude-sonnet-4-6-thinking, claude-opus-4-6-thinking) bypass series groups by default. Use \"Expert Custom Routing\" to override.",
+            "subtitle": "Route models by series or add custom exact mappings.\nNote: Native Claude pass-through is limited to upstream-supported claude-sonnet-4-6 and claude-opus-4-6-thinking. Use \"Expert Custom Routing\" to override.",
             "subtitle_simple": "Customize model routing with wildcards or exact mappings",
             "background_task_title": "Background Task Model",
             "background_task_desc": "Model used for Claude CLI background tasks like title generation, summary, etc. (Default: gemini-2.5-flash)",

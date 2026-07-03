@@ -464,6 +464,11 @@ pub fn wrap_request(
                     }
                 }
             }
+            if let Some(contents) = obj.get_mut("contents") {
+                crate::proxy::mappers::common_utils::force_image_generation_prompts_in_contents(
+                    contents,
+                );
+            }
 
             // 3. Clean generationConfig (remove responseMimeType, responseModalities etc.)
             let gen_config = obj.entry("generationConfig").or_insert_with(|| json!({}));
@@ -940,6 +945,33 @@ mod tests {
 
         // Verify all 15 parts (1 text + 14 images) are preserved
         assert_eq!(result_parts.len(), 15);
+    }
+
+    #[test]
+    fn test_flash_image_model_wraps_as_image_gen() {
+        let body = json!({
+            "model": "gemini-3.1-flash-image",
+            "contents": [{"parts": [{"text": "Draw a cat"}]}]
+        });
+
+        let result = wrap_request(
+            &body,
+            "test-proj",
+            "gemini-3.1-flash-image",
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(result["model"], "gemini-3.1-flash-image");
+        assert_eq!(result["requestType"], "image_gen");
+        assert!(result["request"]["generationConfig"]["imageConfig"].is_object());
+        assert!(result["request"].get("systemInstruction").is_none());
+        let text = result["request"]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("output must be image content only"));
+        assert!(text.ends_with("Draw a cat"));
     }
 
     #[test]

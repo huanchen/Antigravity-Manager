@@ -47,7 +47,8 @@ pub struct ScheduledWarmupConfig {
 fn default_warmup_models() -> Vec<String> {
     vec![
         "gemini-3-flash".to_string(),
-        "claude".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6-thinking".to_string(),
         "gemini-3-pro-high".to_string(),
         "gemini-3-pro-image".to_string(),
     ]
@@ -84,7 +85,8 @@ pub struct QuotaProtectionConfig {
 
 fn default_monitored_models() -> Vec<String> {
     vec![
-        "claude".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6-thinking".to_string(),
         "gemini-3-pro-high".to_string(),
         "gemini-3-flash".to_string(),
         "gemini-3-pro-image".to_string(),
@@ -120,7 +122,8 @@ fn default_pinned_models() -> Vec<String> {
         "gemini-3-pro-high".to_string(),
         "gemini-3-flash".to_string(),
         "gemini-3-pro-image".to_string(),
-        "claude-sonnet-4-6-thinking".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6-thinking".to_string(),
     ]
 }
 

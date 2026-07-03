@@ -35,10 +35,18 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
 
     const claudeSorted = accounts
         .filter(a => a.id !== currentAccountId)
-        .map(a => ({
-            ...a,
-            quotaVal: a.quota?.models.find(m => m.name.toLowerCase().includes('claude'))?.percentage || 0,
-        }))
+        .map(a => {
+            const quotaVal = (a.quota?.models || [])
+                .filter(m =>
+                    m.name.toLowerCase() === 'claude-sonnet-4-6'
+                    || m.name.toLowerCase() === 'claude-opus-4-6-thinking'
+                )
+                .reduce((best, model) => Math.max(best, model.percentage || 0), 0);
+            return {
+                ...a,
+                quotaVal,
+            };
+        })
         .filter(a => a.quotaVal > 0)
         .sort((a, b) => b.quotaVal - a.quotaVal);
 

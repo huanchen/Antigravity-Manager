@@ -16,6 +16,52 @@ pub struct RequestConfig {
     pub image_config: Option<Value>,
 }
 
+const IMAGE_PROMPT_PREFIX: &str = "Create exactly one image that visually represents the following user prompt. Do not answer the prompt, do not provide advice, and do not output explanatory text. The output must be image content only.\n\nUser prompt:\n";
+
+pub fn force_image_generation_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return IMAGE_PROMPT_PREFIX.trim_end().to_string();
+    }
+
+    if trimmed.starts_with(IMAGE_PROMPT_PREFIX) {
+        return trimmed.to_string();
+    }
+
+    format!("{}{}", IMAGE_PROMPT_PREFIX, trimmed)
+}
+
+pub fn force_image_generation_prompts_in_contents(contents: &mut Value) {
+    let Some(contents_arr) = contents.as_array_mut() else {
+        return;
+    };
+
+    for content in contents_arr {
+        let role = content
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user");
+        if role != "user" {
+            continue;
+        }
+
+        let Some(parts) = content.get_mut("parts").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+
+        if let Some(text_part) = parts
+            .iter_mut()
+            .find(|part| part.get("text").and_then(|v| v.as_str()).is_some())
+        {
+            let text = text_part
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            text_part["text"] = json!(force_image_generation_prompt(text));
+        }
+    }
+}
+
 pub fn resolve_request_config(
     original_model: &str,
     mapped_model: &str,
@@ -26,7 +72,7 @@ pub fn resolve_request_config(
     body: Option<&Value>,     // [NEW] Request body for Gemini native imageConfig
 ) -> RequestConfig {
     // 1. Image Generation Check (Priority)
-    if mapped_model.starts_with("gemini-3-pro-image") {
+    if crate::proxy::common::model_mapping::is_image_generation_model(mapped_model) {
         // [RESOLVE #1694] Improved priority logic:
         // 1. First parse inferred config from model suffix and OpenAI parameters
         let (mut inferred_config, parsed_base_model) =
@@ -618,6 +664,33 @@ mod tests {
         );
         assert_eq!(config.request_type, "image_gen");
         assert!(!config.inject_google_search);
+    }
+
+    #[test]
+    fn test_flash_image_model_is_image_generation() {
+        let config = resolve_request_config(
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-image",
+            &None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(config.request_type, "image_gen");
+        assert!(!config.inject_google_search);
+        assert_eq!(config.final_model, "gemini-3.1-flash-image");
+        assert_eq!(config.image_config.unwrap()["aspectRatio"], "1:1");
+    }
+
+    #[test]
+    fn test_force_image_generation_prompt() {
+        let prompt = force_image_generation_prompt("Banana says hello");
+        assert!(prompt.contains("output must be image content only"));
+        assert!(prompt.ends_with("Banana says hello"));
+
+        let wrapped_again = force_image_generation_prompt(&prompt);
+        assert_eq!(wrapped_again, prompt);
     }
 
     #[test]

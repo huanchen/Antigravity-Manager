@@ -131,6 +131,7 @@ interface AccountRowContentProps {
 
 const MODEL_GROUPS = {
     CLAUDE: [
+        'claude-sonnet-4-6',
         'claude-opus-4-6-thinking',
         'claude'
     ],

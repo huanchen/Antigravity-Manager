@@ -39,8 +39,8 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
     const geminiImageModel = account.quota?.models.find(m => m.name.toLowerCase() === 'gemini-3-pro-image');
 
     const claudeGroupNames = [
-        'claude-opus-4-6-thinking',
-        'claude'
+        'claude-sonnet-4-6',
+        'claude-opus-4-6-thinking'
     ];
     const claudeModel = account.quota?.models
         .filter(m => claudeGroupNames.includes(m.name.toLowerCase()))
@@ -191,7 +191,9 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     <div className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {(account.protected_models?.includes('claude')
+                                    || account.protected_models?.includes('claude-sonnet-4-6')
+                                    || account.protected_models?.includes('claude-opus-4-6-thinking')) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
                                 Claude 系列
                             </span>
                             <div className="flex items-center gap-2">

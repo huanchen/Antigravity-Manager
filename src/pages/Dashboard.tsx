@@ -55,14 +55,22 @@ function Dashboard() {
             )?.percentage || 0)
             .filter(q => q > 0);
 
+        const getClaudeQuota = (account: typeof accounts[number]) =>
+            account.quota?.models
+                .filter(m =>
+                    m.name.toLowerCase() === 'claude-sonnet-4-6' ||
+                    m.name.toLowerCase() === 'claude-opus-4-6-thinking'
+                )
+                .reduce((best, model) => Math.max(best, model.percentage || 0), 0) || 0;
+
         const claudeQuotas = accounts
-            .map(a => a.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-6' || m.name.toLowerCase() === 'claude-sonnet-4-5')?.percentage || 0)
+            .map(a => getClaudeQuota(a))
             .filter(q => q > 0);
 
         const lowQuotaCount = accounts.filter(a => {
             if (a.quota?.is_forbidden) return false;
             const gemini = getGeminiProQuota(a);
-            const claude = a.quota?.models.find(m => m.name.toLowerCase() === 'claude-sonnet-4-6' || m.name.toLowerCase() === 'claude-sonnet-4-5')?.percentage || 0;
+            const claude = getClaudeQuota(a);
             return gemini < 20 || claude < 20;
         }).length;
 

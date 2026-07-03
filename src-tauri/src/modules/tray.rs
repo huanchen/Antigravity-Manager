@@ -219,7 +219,7 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
                     if q.is_forbidden {
                         menu_lines.push(format!("🚫 {}", texts.forbidden));
                     } else {
-                        // Extract the 3 specified models
+                        // Extract the pinned high-signal quota models
                         let mut gemini_high = 0;
                         let mut gemini_image = 0;
                         let mut claude = 0;
@@ -233,14 +233,14 @@ pub fn update_tray_menus(app: &tauri::AppHandle) {
                             if name == "gemini-3-pro-image" {
                                 gemini_image = m.percentage;
                             }
-                            if name == "claude-sonnet-4-6" || name == "claude-sonnet-4-5" {
+                            if name == "claude-sonnet-4-6" {
                                 claude = m.percentage;
                             }
                         }
 
                         menu_lines.push(format!("Gemini High: {}%", gemini_high));
                         menu_lines.push(format!("Gemini Image: {}%", gemini_image));
-                        menu_lines.push(format!("Claude 4.5: {}%", claude));
+                        menu_lines.push(format!("Claude 4.6: {}%", claude));
                     }
                 } else {
                     menu_lines.push(texts.unknown_quota.clone());

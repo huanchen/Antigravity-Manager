@@ -17,7 +17,9 @@ use crate::proxy::upstream::client::mask_email;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+    acquire_global_image_permit, acquire_image_account_permit, apply_retry_strategy,
+    determine_retry_strategy, image_max_attempts, is_retryable_image_error,
+    should_rotate_account, RetryStrategy,
 };
 use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
@@ -1882,15 +1884,15 @@ pub async fn handle_images_generations_internal(
         "natural" => final_prompt.push_str(", (natural lighting, realistic, photorealistic)"),
         _ => {}
     }
+    let final_prompt =
+        crate::proxy::mappers::common_utils::force_image_generation_prompt(&final_prompt);
 
     // 4. 并发发送请求
     // 注意：不再在外部获取 Token，而是移入 Task 内部并在重试时获取
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager.clone();
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS
-        .min(max_pool_size.saturating_add(1))
-        .max(2);
+    let max_attempts = image_max_attempts(max_pool_size);
 
     let mut tasks = Vec::new();
 
@@ -1905,6 +1907,9 @@ pub async fn handle_images_generations_internal(
 
         tasks.push(tokio::spawn(async move {
             let mut last_error = String::new();
+            let _global_permit = acquire_global_image_permit()
+                .await
+                .map_err(|e| format!("Image concurrency limit reached: {}", e))?;
 
             for attempt in 0..max_attempts {
                 // 4.1 获取 Token
@@ -1914,14 +1919,15 @@ pub async fn handle_images_generations_internal(
                 {
                     Ok(t) => t,
                     Err(e) => {
-                        last_error = format!("Token error: {}", e);
-                        if attempt < max_attempts - 1 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                        break;
+                        return Err(format!("Token error: {}", e));
                     }
                 };
+
+                let model_to_use = token_manager
+                    .resolve_dynamic_model_for_account(&account_id, &model_to_use)
+                    .await;
+
+                let _permit = acquire_image_account_permit(&account_id).await;
 
                 let gemini_body = json!({
                     "project": project_id,
@@ -1966,22 +1972,20 @@ pub async fn handle_images_generations_internal(
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
 
-                            // 429/500/503 等错误进行标记和重试
-                            if status_code == 429 || status_code == 503 || status_code == 500 {
+                            // Retry only account/model-specific failures.
+                            // 404 often means the selected account does not expose this physical image model.
+                            if is_retryable_image_error(status_code, &err_text) {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
                                     email,
                                     status_code
                                 );
-                                token_manager
-                                    .mark_rate_limited_async(
-                                        &email,
-                                        status_code,
-                                        None,
-                                        &err_text,
-                                        Some("dall-e-3"),
-                                    )
-                                    .await;
+                                token_manager.mark_image_error_fast_with_body(
+                                    &account_id,
+                                    status_code,
+                                    Some(&model_to_use),
+                                    Some(&err_text),
+                                );
                                 continue; // Retry loop
                             }
 
@@ -1995,7 +1999,11 @@ pub async fn handle_images_generations_internal(
                     }
                     Err(e) => {
                         last_error = format!("Network error: {}", e);
-                        continue;
+                        tracing::warn!(
+                            "[Images] Upstream request failed, returning without account fan-out: {}",
+                            e
+                        );
+                        return Err(last_error);
                     }
                 }
             }
@@ -2071,7 +2079,10 @@ pub async fn handle_images_generations_internal(
         tracing::error!("[Images] All {} requests failed. Errors: {}", n, error_msg);
 
         // [FIX] Map upstream status codes correctly instead of forcing 502
-        let status = if error_msg.contains("429") || error_msg.contains("Quota exhausted") {
+        let status = if error_msg.contains("429")
+            || error_msg.contains("Quota exhausted")
+            || error_msg.contains("concurrency")
+        {
             StatusCode::TOO_MANY_REQUESTS
         } else if error_msg.contains("503") || error_msg.contains("Service Unavailable") {
             StatusCode::SERVICE_UNAVAILABLE
@@ -2246,6 +2257,8 @@ pub async fn handle_images_edits(
     if let Some(s) = style {
         final_prompt.push_str(&format!(", style: {}", s));
     }
+    let final_prompt =
+        crate::proxy::mappers::common_utils::force_image_generation_prompt(&final_prompt);
     contents_parts.push(json!({
         "text": final_prompt
     }));
@@ -2285,9 +2298,7 @@ pub async fn handle_images_edits(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager.clone();
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS
-        .min(max_pool_size.saturating_add(1))
-        .max(2);
+    let max_attempts = image_max_attempts(max_pool_size);
 
     let mut tasks = Vec::new();
     for _ in 0..n {
@@ -2300,23 +2311,27 @@ pub async fn handle_images_edits(
 
         tasks.push(tokio::spawn(async move {
             let mut last_error = String::new();
+            let _global_permit = acquire_global_image_permit()
+                .await
+                .map_err(|e| format!("Image concurrency limit reached: {}", e))?;
 
             for attempt in 0..max_attempts {
                 // 4.1 获取 Token
                 let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-                    .get_token("image_gen", attempt > 0, None, "gemini-3-pro-image")
+                    .get_token("image_gen", attempt > 0, None, &model)
                     .await
                 {
                     Ok(t) => t,
                     Err(e) => {
-                        last_error = format!("Token error: {}", e);
-                        if attempt < max_attempts - 1 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                        break;
+                        return Err(format!("Token error: {}", e));
                     }
                 };
+
+                let model = token_manager
+                    .resolve_dynamic_model_for_account(&account_id, &model)
+                    .await;
+
+                let _permit = acquire_image_account_permit(&account_id).await;
 
                 // 4.2 Construct Request Body (Need project_id)
                 let gemini_body = json!({
@@ -2367,22 +2382,18 @@ pub async fn handle_images_edits(
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
 
-                            // 429/500/503 等错误进行标记和重试
-                            if status_code == 429 || status_code == 503 || status_code == 500 {
+                            if is_retryable_image_error(status_code, &err_text) {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
                                     email,
                                     status_code
                                 );
-                                token_manager
-                                    .mark_rate_limited_async(
-                                        &email,
-                                        status_code,
-                                        None,
-                                        &err_text,
-                                        Some("dall-e-3"),
-                                    )
-                                    .await;
+                                token_manager.mark_image_error_fast_with_body(
+                                    &account_id,
+                                    status_code,
+                                    Some(&model),
+                                    Some(&err_text),
+                                );
                                 continue; // Retry loop
                             }
                             return Err(last_error);
@@ -2394,7 +2405,11 @@ pub async fn handle_images_edits(
                     }
                     Err(e) => {
                         last_error = format!("Network error: {}", e);
-                        continue;
+                        tracing::warn!(
+                            "[Images] Upstream edit request failed, returning without account fan-out: {}",
+                            e
+                        );
+                        return Err(last_error);
                     }
                 }
             }
@@ -2469,7 +2484,18 @@ pub async fn handle_images_edits(
             n,
             error_msg
         );
-        return Err((StatusCode::BAD_GATEWAY, error_msg));
+        let status = if error_msg.contains("429")
+            || error_msg.contains("Quota exhausted")
+            || error_msg.contains("concurrency")
+        {
+            StatusCode::TOO_MANY_REQUESTS
+        } else if error_msg.contains("503") || error_msg.contains("Service Unavailable") {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+
+        return Err((status, error_msg));
     }
 
     if !errors.is_empty() {

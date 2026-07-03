@@ -1,0 +1,22 @@
+services:
+  antigravity-manager:
+    image: lbjlaq/antigravity-manager:latest
+    container_name: antigravity-manager
+    restart: unless-stopped
+    env_file:
+      - ./.env.local
+    environment:
+      LOG_LEVEL: info
+      PORT: "8045"
+      ABV_AUTH_MODE: all_except_health
+      ABV_MAX_BODY_SIZE: "104857600"
+    ports:
+      - "0.0.0.0:8045:8045"
+    volumes:
+      - /opt/antigravity-manager-data:/root/.antigravity_tools
+    networks:
+      - antigravity-manager
+
+networks:
+  antigravity-manager:
+    name: antigravity-manager

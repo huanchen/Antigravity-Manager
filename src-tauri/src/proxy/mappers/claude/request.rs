@@ -1933,10 +1933,22 @@ fn build_generation_config(
     // max_tokens 映射为 maxOutputTokens
     // [FIX] 不再默认设置 81920，防止非思维模型 (如 claude-sonnet-4-6) 报 400 Invalid Argument
     let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
+    let model_lower = mapped_model.to_lowercase();
+    if final_max_tokens.is_none()
+        && model_lower.contains("gemini")
+        && !model_lower.contains("-image")
+    {
+        let default_limit = crate::proxy::model_specs::get_max_output_tokens(mapped_model, token);
+        final_max_tokens = Some(default_limit as i64);
+        tracing::info!(
+            "[Generation-Config] Defaulting maxOutputTokens to {} for Anthropic-format Gemini model {}",
+            default_limit,
+            mapped_model
+        );
+    }
 
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    let model_lower = mapped_model.to_lowercase();
     // 重新计算 should_use_adaptive (因为上面定义的作用域仅在其 if 块内有效，或者我们可以假设在这里也需要同样的逻辑)
     // 但为了简洁和解耦，我们这里重新从 config 读取
     let tb_config_chk = crate::proxy::config::get_thinking_budget_config();
@@ -2758,6 +2770,35 @@ mod tests {
             "maxOutputTokens should not be set when max_tokens is None"
         );
     }
+
+    #[test]
+    fn test_default_max_tokens_for_anthropic_format_gemini() {
+        let req = ClaudeRequest {
+            model: "gemini-3.1-pro-high".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Write a long answer".to_string()),
+            }],
+            system: None,
+            tools: None,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let result =
+            transform_claude_request_in(&req, "test-v", false, None, "test_session", None).unwrap();
+        let gen_config = &result["request"]["generationConfig"];
+        assert_eq!(gen_config["maxOutputTokens"].as_i64(), Some(65536));
+    }
+
     #[test]
     fn test_claude_flash_thinking_budget_capping() {
         // Use full path or ensure import of ThinkingConfig

@@ -65,7 +65,7 @@ function Settings() {
             monitored_models: []
         },
         pinned_quota_models: {
-            models: ['gemini-3-pro-high', 'gemini-3-flash', 'gemini-3-pro-image', 'claude-opus-4-6-thinking']
+            models: ['gemini-3-pro-high', 'gemini-3-flash', 'gemini-3-pro-image', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking']
         },
         cloudflared: {
             enabled: false,

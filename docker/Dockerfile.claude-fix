@@ -1,0 +1,94 @@
+# --- Frontend Build Stage ---
+FROM node:20-slim AS frontend-builder
+ARG USE_MIRROR=auto
+WORKDIR /app
+
+RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
+    echo "Using npm mirror..."; \
+    npm config set registry https://registry.npmmirror.com; \
+    else \
+    echo "Using default npm registry..."; \
+    fi
+
+COPY tsconfig.json tsconfig.node.json vite.config.ts tailwind.config.js postcss.config.cjs index.html ./
+COPY package*.json ./
+COPY public ./public
+COPY src ./src
+COPY src-tauri/icons ./src-tauri/icons
+RUN npm ci --legacy-peer-deps --prefer-offline --no-audit --no-fund && \
+    npm run build && \
+    npm cache clean --force && \
+    rm -rf node_modules /root/.npm
+
+# --- Backend Build Stage ---
+FROM rust:1-slim-bookworm AS backend-builder
+ARG USE_MIRROR=auto
+ARG CARGO_BUILD_JOBS=2
+
+RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
+    echo "Using Aliyun mirror for APT..."; \
+    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources || \
+    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
+    else \
+    echo "Using default APT sources..."; \
+    fi
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    build-essential \
+    curl \
+    wget \
+    file \
+    libssl-dev \
+    libgtk-3-dev \
+    libwebkit2gtk-4.1-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    libsoup-3.0-dev \
+    libjavascriptcoregtk-4.1-dev \
+    perl \
+    cmake \
+    golang-go \
+    clang \
+    libclang-dev \
+    git \
+    ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN which go && go version || (echo "ERROR: Go compiler not found" && exit 1)
+
+ENV CARGO_HTTP_MULTIPLEXING=false
+RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
+    echo "Using Aliyun mirror for Cargo..."; \
+    mkdir -p /root/.cargo && \
+    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > /root/.cargo/config.toml; \
+    else \
+    echo "Using default Cargo registry..."; \
+    fi
+
+WORKDIR /app
+COPY src-tauri ./src-tauri
+COPY src/locales ./src/locales
+COPY --from=frontend-builder /app/dist ./dist
+
+WORKDIR /app/src-tauri
+RUN cargo build --release --bin antigravity_tools -j ${CARGO_BUILD_JOBS} && \
+    cp target/release/antigravity_tools /tmp/antigravity_tools && \
+    (strip /tmp/antigravity_tools || true) && \
+    cargo clean && \
+    rm -rf /root/.cargo/registry /root/.cargo/git /app/dist
+
+# --- Final Runtime Stage ---
+FROM lbjlaq/antigravity-manager:latest
+WORKDIR /app
+
+COPY --from=backend-builder /tmp/antigravity_tools /app/antigravity-tools
+COPY --from=frontend-builder /app/dist /app/dist
+
+ENV ABV_DIST_PATH=/app/dist
+ENV RUST_LOG=info
+ENV PORT=8045
+
+EXPOSE 8045
+
+ENTRYPOINT ["/app/antigravity-tools", "--headless"]

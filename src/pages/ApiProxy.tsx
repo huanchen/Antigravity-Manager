@@ -516,11 +516,7 @@ export default function ApiProxy() {
                 "gpt-3.5*": "gemini-2.5-flash",
                 "o1-*": "gemini-3.1-pro-high",
                 "o3-*": "gemini-3.1-pro-high",
-                "claude-3-5-sonnet-*": "claude-sonnet-4-6",
-                "claude-3-opus-*": "claude-opus-4-6-thinking",
                 "claude-opus-4-6*": "claude-opus-4-6-thinking",
-                "claude-haiku-*": "gemini-2.5-flash",
-                "claude-3-haiku-*": "gemini-2.5-flash",
             }
         },
         {
@@ -533,11 +529,7 @@ export default function ApiProxy() {
                 "gpt-3.5*": "gemini-3-flash",
                 "o1-*": "claude-opus-4-6-thinking",
                 "o3-*": "claude-opus-4-6-thinking",
-                "claude-3-5-sonnet-*": "claude-sonnet-4-6",
-                "claude-3-opus-*": "claude-opus-4-6-thinking",
                 "claude-opus-4-6*": "claude-opus-4-6-thinking",
-                "claude-haiku-*": "claude-sonnet-4-6",
-                "claude-3-haiku-*": "claude-sonnet-4-6",
             }
         },
         {
@@ -550,11 +542,6 @@ export default function ApiProxy() {
                 "gpt-3.5*": "gemini-2.5-flash",
                 "o1-*": "gemini-3-flash",
                 "o3-*": "gemini-3-flash",
-                "claude-3-5-sonnet-*": "gemini-3-flash",
-                "claude-3-opus-*": "gemini-3-flash",
-                "claude-opus-4-*": "gemini-3-flash", // Cost-effective: map all opus 4 to flash
-                "claude-haiku-*": "gemini-2.5-flash",
-                "claude-3-haiku-*": "gemini-2.5-flash",
             }
         },
         {
@@ -567,12 +554,7 @@ export default function ApiProxy() {
                 "gpt-3.5*": "gemini-2.5-flash",
                 "o1-*": "claude-sonnet-4-6",
                 "o3-*": "claude-sonnet-4-6",
-                "claude-3-5-sonnet-*": "claude-sonnet-4-6",
-                "claude-3-opus-*": "gemini-3.1-pro-high",
-                "claude-opus-4-5*": "gemini-3.1-pro-high",
-                "claude-opus-4-6*": "claude-opus-4-6-thinking", // Balanced: Keep 4.6 as itself (or map to high?) Let's map to itself for now to utilize header
-                "claude-haiku-*": "gemini-2.5-flash",
-                "claude-3-haiku-*": "gemini-2.5-flash",
+                "claude-opus-4-6*": "claude-opus-4-6-thinking",
             }
         },
     ], [t]);
@@ -1655,7 +1637,7 @@ print(response.choices[0].message.content)`;
                                                 <div className="flex items-center gap-2 pt-2 border-t border-gray-200/50">
                                                     <input
                                                         className="input input-xs input-bordered flex-1 font-mono"
-                                                        placeholder={t('proxy.config.zai.models.from_placeholder') || "From (e.g. claude-3-opus)"}
+                                                        placeholder={t('proxy.config.zai.models.from_placeholder') || "From (e.g. claude-opus-4-6)"}
                                                         value={zaiNewMappingFrom}
                                                         onChange={e => setZaiNewMappingFrom(e.target.value)}
                                                     />

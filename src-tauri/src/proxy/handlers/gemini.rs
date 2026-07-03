@@ -11,7 +11,9 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account,
+    acquire_global_image_permit, acquire_image_account_permit, apply_retry_strategy,
+    determine_retry_strategy, image_max_attempts, is_retryable_image_error,
+    should_rotate_account,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request};
 use crate::proxy::server::AppState;
@@ -89,48 +91,74 @@ pub async fn handle_generate(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+
+    // 3. 模型路由解析
+    let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &model_name,
+        &*state.custom_mapping.read().await,
+    );
+    // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
+    let tools_val: Option<Vec<Value>> =
+        body.get("tools").and_then(|t| t.as_array()).map(|arr| {
+            let mut flattened = Vec::new();
+            for tool_entry in arr {
+                if let Some(decls) = tool_entry
+                    .get("functionDeclarations")
+                    .and_then(|v| v.as_array())
+                {
+                    flattened.extend(decls.iter().cloned());
+                } else {
+                    flattened.push(tool_entry.clone());
+                }
+            }
+            flattened
+        });
+
+    let config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &model_name,
+        &mapped_model,
+        &tools_val,
+        None,        // size (not applicable for Gemini native protocol)
+        None,        // quality
+        None,        // image_size
+        Some(&body), // Pass request body for imageConfig parsing
+    );
+    let is_image_request = config.request_type == "image_gen";
+    let max_attempts = if is_image_request {
+        image_max_attempts(pool_size)
+    } else {
+        MAX_RETRY_ATTEMPTS.min(pool_size).max(1)
+    };
+    let _global_image_permit = if is_image_request {
+        match acquire_global_image_permit().await {
+            Ok(permit) => Some(permit),
+            Err(e) => {
+                tracing::warn!("[Gemini-Images] {}", e);
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": {
+                            "code": 429,
+                            "message": e,
+                            "status": "RESOURCE_EXHAUSTED"
+                        }
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        None
+    };
+
+    // 提取 SessionId (粘性指纹)
+    let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
 
     for attempt in 0..max_attempts {
-        // 3. 模型路由解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &model_name,
-            &*state.custom_mapping.read().await,
-        );
-        // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
-        let tools_val: Option<Vec<Value>> =
-            body.get("tools").and_then(|t| t.as_array()).map(|arr| {
-                let mut flattened = Vec::new();
-                for tool_entry in arr {
-                    if let Some(decls) = tool_entry
-                        .get("functionDeclarations")
-                        .and_then(|v| v.as_array())
-                    {
-                        flattened.extend(decls.iter().cloned());
-                    } else {
-                        flattened.push(tool_entry.clone());
-                    }
-                }
-                flattened
-            });
-
-        let config = crate::proxy::mappers::common_utils::resolve_request_config(
-            &model_name,
-            &mapped_model,
-            &tools_val,
-            None,        // size (not applicable for Gemini native protocol)
-            None,        // quality
-            None,        // [NEW] image_size
-            Some(&body), // [NEW] Pass request body for imageConfig parsing
-        );
-
         // 4. 获取 Token (使用准确的 request_type)
-        // 提取 SessionId (粘性指纹)
-        let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
-
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
@@ -156,6 +184,12 @@ pub async fn handle_generate(
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let _image_permit = if is_image_request {
+            Some(acquire_image_account_permit(&account_id).await)
+        } else {
+            None
+        };
 
         // 5. 包装请求 (project injection)
         // [FIX #765] Pass session_id to wrap_request for signature injection
@@ -222,6 +256,28 @@ pub async fn handle_generate(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                if is_image_request {
+                    tracing::warn!(
+                        "[Gemini-Images] Account {} upstream call failed, returning without account fan-out: {}",
+                        mask_email(&email),
+                        e
+                    );
+                    return Ok((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [
+                            ("X-Account-Email", email.as_str()),
+                            ("X-Mapped-Model", mapped_model.as_str()),
+                        ],
+                        Json(json!({
+                            "error": {
+                                "code": 503,
+                                "message": format!("Upstream image request failed: {}", e),
+                                "status": "UPSTREAM_ERROR"
+                            }
+                        })),
+                    )
+                        .into_response());
+                }
                 debug!(
                     "Gemini Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -600,6 +656,43 @@ pub async fn handle_generate(
                 &payload,
             )
             .await;
+        }
+
+        if is_image_request && matches!(status_code, 500 | 503 | 529) {
+            tracing::warn!(
+                "[Gemini-Images] Upstream service error {}, returning without retry/backoff",
+                status_code
+            );
+            return Ok((
+                status,
+                [
+                    ("X-Account-Email", email.as_str()),
+                    ("X-Mapped-Model", mapped_model.as_str()),
+                ],
+                Json(json!({
+                    "error": {
+                        "code": status_code,
+                        "message": error_text,
+                        "status": "UPSTREAM_ERROR"
+                    }
+                })),
+            )
+                .into_response());
+        }
+
+        if is_image_request && is_retryable_image_error(status_code, &error_text) {
+            tracing::warn!(
+                "[Gemini-Images] Account {} image error {}, rotating without backoff",
+                mask_email(&email),
+                status_code
+            );
+            token_manager.mark_image_error_fast_with_body(
+                &account_id,
+                status_code,
+                Some(&mapped_model),
+                Some(&error_text),
+            );
+            continue;
         }
 
         // 确定重试策略
