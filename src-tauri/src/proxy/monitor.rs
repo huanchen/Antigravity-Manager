@@ -5,7 +5,7 @@ use tauri::Emitter;
 use tokio::sync::RwLock;
 
 const DB_LOG_RETENTION_DAYS: i64 = 7;
-const DB_MAX_LOG_ROWS: usize = 20_000;
+const DB_MAX_LOG_ROWS: usize = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {

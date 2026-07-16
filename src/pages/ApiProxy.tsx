@@ -703,6 +703,8 @@ export default function ApiProxy() {
                 ...appConfig.proxy,
                 experimental: {
                     ...(appConfig.proxy.experimental || {
+                        hide_thinking_output: true,
+                        direct_non_stream: true,
                         enable_usage_scaling: true,
                         context_compression_threshold_l1: 0.4,
                         context_compression_threshold_l2: 0.55,
@@ -1914,6 +1916,40 @@ print(response.choices[0].message.content)`;
                                 icon={<Sparkles size={18} className="text-purple-500" />}
                             >
                                 <div className="space-y-4">
+                                    <div className="flex items-center justify-between gap-4 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
+                                        <div className="space-y-1">
+                                            <span className="text-sm font-bold text-gray-900 dark:text-base-content">
+                                                {t('proxy.config.experimental.hide_thinking_output')}
+                                            </span>
+                                            <p className="text-[10px] text-gray-500 dark:text-gray-400 max-w-lg">
+                                                {t('proxy.config.experimental.hide_thinking_output_tooltip')}
+                                            </p>
+                                        </div>
+                                        <input
+                                            type="checkbox"
+                                            className="toggle toggle-sm toggle-primary shrink-0"
+                                            checked={appConfig.proxy.experimental?.hide_thinking_output !== false}
+                                            onChange={(e) => updateExperimentalConfig({ hide_thinking_output: e.target.checked })}
+                                        />
+                                    </div>
+
+                                    <div className="flex items-center justify-between gap-4 p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
+                                        <div className="space-y-1">
+                                            <span className="text-sm font-bold text-gray-900 dark:text-base-content">
+                                                {t('proxy.config.experimental.direct_non_stream')}
+                                            </span>
+                                            <p className="text-[10px] text-gray-500 dark:text-gray-400 max-w-lg">
+                                                {t('proxy.config.experimental.direct_non_stream_tooltip')}
+                                            </p>
+                                        </div>
+                                        <input
+                                            type="checkbox"
+                                            className="toggle toggle-sm toggle-primary shrink-0"
+                                            checked={appConfig.proxy.experimental?.direct_non_stream !== false}
+                                            onChange={(e) => updateExperimentalConfig({ direct_non_stream: e.target.checked })}
+                                        />
+                                    </div>
+
                                     <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
                                         <div className="space-y-1">
                                             <div className="flex items-center gap-2">

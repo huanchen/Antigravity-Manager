@@ -112,6 +112,8 @@ export interface PinnedQuotaModelsConfig {
 }
 
 export interface ExperimentalConfig {
+    hide_thinking_output?: boolean;
+    direct_non_stream?: boolean;
     enable_usage_scaling: boolean;
     context_compression_threshold_l1?: number;
     context_compression_threshold_l2?: number;

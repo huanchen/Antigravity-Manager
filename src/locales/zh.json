@@ -798,6 +798,10 @@
             "experimental": {
                 "title": "实验性设置 (Experimental)",
                 "title_tooltip": "探索性功能，可能在未来版本中调整或移除。",
+                "hide_thinking_output": "隐藏思维过程",
+                "hide_thinking_output_tooltip": "隐藏 Gemini CLI、OpenAI 和 Codex 响应中的思维文本，同时保留工具调用所需的思维签名。",
+                "direct_non_stream": "非流式请求直接透传",
+                "direct_non_stream_tooltip": "stream=false 时直接调用上游 generateContent，避免内部 SSE 聚合造成末尾截断。",
                 "enable_usage_scaling": "启用用量缩放",
                 "enable_usage_scaling_tooltip": "针对 Claude 兼容协议。当总输入超过 30k Token 时开启激进缩放，防止在大上下文下频繁触发客户端压缩。注意：开启后客户端显示的用量不再代表实际计费点数。",
                 "context_compression_threshold_l1": "L1 压缩阈值 (工具记录清理)",

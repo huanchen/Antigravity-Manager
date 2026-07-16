@@ -49,7 +49,7 @@ pub fn transform_openai_request(
         || mapped_model_lower.contains("gemini-3.1-flash"))
         && !mapped_model_lower.contains("claude");
     let is_claude_thinking = mapped_model_lower.ends_with("-thinking");
-    let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
+    let is_thinking_model = is_gemini_3_thinking || is_claude_thinking;
 
     // [NEW] 检查用户是否在请求中显式启用 thinking
     let user_enabled_thinking = request
@@ -446,18 +446,13 @@ pub fn transform_openai_request(
         "topK": 40,
     });
 
-    // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)
     if let Some(max_tokens) = request.max_tokens {
         gen_config["maxOutputTokens"] = json!(max_tokens);
-    } else {
-        // 使用动态优先的规格限额
-        let limit = model_specs::get_max_output_tokens(mapped_model, token);
-        gen_config["maxOutputTokens"] = json!(limit);
     }
 
     // [NEW] 支持多候选结果数量 (n -> candidateCount)
     if let Some(n) = request.n {
-        gen_config["candidateCount"] = json!(n);
+        gen_config["candidateCount"] = json!(n.clamp(1, 8));
     }
 
     // 为 thinking 模型注入 thinkingConfig (使用 thinkingBudget 而非 thinkingLevel)
@@ -549,16 +544,32 @@ pub fn transform_openai_request(
     }
 
     if let Some(stop) = &request.stop {
-        if stop.is_string() {
-            gen_config["stopSequences"] = json!([stop]);
-        } else if stop.is_array() {
-            gen_config["stopSequences"] = stop.clone();
+        let stop_sequences: Vec<String> = if let Some(stop_text) = stop.as_str() {
+            vec![stop_text.to_string()]
+        } else if let Some(stops) = stop.as_array() {
+            stops
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if !stop_sequences.is_empty() {
+            gen_config["stopSequences"] = json!(stop_sequences);
         }
     }
 
     if let Some(fmt) = &request.response_format {
         if fmt.r#type == "json_object" {
             gen_config["responseMimeType"] = json!("application/json");
+        } else if fmt.r#type == "json_schema" {
+            gen_config["responseMimeType"] = json!("application/json");
+            if let Some(schema) = extract_response_format_schema(fmt) {
+                gen_config["responseSchema"] = schema;
+            }
         }
     }
 
@@ -785,6 +796,29 @@ fn enforce_uppercase_types(value: &mut Value) {
     }
 }
 
+fn extract_response_format_schema(fmt: &ResponseFormat) -> Option<Value> {
+    let schema_source = fmt
+        .json_schema
+        .as_ref()
+        .and_then(|v| {
+            v.get("schema").or_else(|| {
+                if v.get("type").is_some()
+                    || v.get("properties").is_some()
+                    || v.get("$defs").is_some()
+                {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+        })
+        .or(fmt.schema.as_ref());
+
+    let mut schema = schema_source?.clone();
+    crate::proxy::common::json_schema::clean_json_schema(&mut schema);
+    Some(schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1006,140 @@ mod tests {
         // Should use user budget (16000) or capped valid default
         assert_eq!(budget, 16000);
     }
+
+    #[test]
+    fn test_plain_openai_request_does_not_default_max_output_tokens() {
+        let req = OpenAIRequest {
+            model: "gemini-2.5-flash-lite".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIContent::String("hi".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            ..Default::default()
+        };
+
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-2.5-flash", None);
+        let gen_config = &result["request"]["generationConfig"];
+
+        assert!(
+            gen_config.get("maxOutputTokens").is_none(),
+            "plain requests should let upstream choose the model default"
+        );
+    }
+
+    #[test]
+    fn test_gemini_3_flash_plain_request_does_not_auto_enable_thinking() {
+        let req = OpenAIRequest {
+            model: "gemini-3-flash".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIContent::String("hi".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            ..Default::default()
+        };
+
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-3-flash", None);
+        let gen_config = &result["request"]["generationConfig"];
+
+        assert!(
+            gen_config.get("thinkingConfig").is_none(),
+            "plain gemini-3-flash requests should not force thinking"
+        );
+        assert!(
+            gen_config.get("maxOutputTokens").is_none(),
+            "plain gemini-3-flash requests should not force maxOutputTokens"
+        );
+    }
+
+    #[test]
+    fn test_openai_json_schema_response_format_is_cleaned_for_gemini() {
+        let req = OpenAIRequest {
+            model: "gemini-2.5-flash".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: Some(OpenAIContent::String("Return JSON".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            response_format: Some(
+                serde_json::from_value(json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "result",
+                        "strict": true,
+                        "schema": {
+                            "type": "object",
+                            "$defs": {
+                                "Item": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "const": "ok" },
+                                        "text": { "type": "string" }
+                                    },
+                                    "required": ["kind", "text"]
+                                }
+                            },
+                            "properties": {
+                                "items": {
+                                    "type": "array",
+                                    "items": { "$ref": "#/$defs/Item" }
+                                }
+                            },
+                            "required": ["items"]
+                        }
+                    }
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-2.5-flash", None);
+        let gen_config = &result["request"]["generationConfig"];
+        let schema_text = serde_json::to_string(&gen_config["responseSchema"]).unwrap();
+
+        assert_eq!(gen_config["responseMimeType"], "application/json");
+        assert!(gen_config.get("responseSchema").is_some());
+        assert!(!schema_text.contains("\"$defs\""));
+        assert!(!schema_text.contains("\"$ref\""));
+        assert!(!schema_text.contains("\"const\""));
+    }
+
+    #[test]
+    fn test_openai_generation_controls_are_sanitized() {
+        let req: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-2.5-flash",
+            "messages": [
+                { "role": "user", "content": "hi" }
+            ],
+            "max_completion_tokens": 123,
+            "n": 0,
+            "stop": ["END", 123, "", null]
+        }))
+        .unwrap();
+
+        let (result, _sid, _msg_count) =
+            transform_openai_request(&req, "test-p", "gemini-2.5-flash", None);
+        let gen_config = &result["request"]["generationConfig"];
+
+        assert_eq!(gen_config["maxOutputTokens"].as_u64(), Some(123));
+        assert_eq!(gen_config["candidateCount"].as_u64(), Some(1));
+        assert_eq!(gen_config["stopSequences"], json!(["END"]));
+    }
+
     #[test]
     fn test_gemini_3_pro_image_not_thinking() {
         let req = OpenAIRequest {

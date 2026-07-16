@@ -52,3 +52,11 @@ scripts/dump_full.py
 scripts/probe_weekly.py
 scripts/probe_quota_summary.pyDOCKER_DEPLOYMENT.md
 pnpm-lock.yaml
+
+# Local deployment artifacts and migration backups
+/Antigravity Tools_*.deb
+/backups/
+/bin/
+/squashfs-root/
+/docker/Dockerfile.backend.localdist.legacy
+/docker/Dockerfile.runtime.from-local-429fix

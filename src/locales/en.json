@@ -805,6 +805,10 @@
             "experimental": {
                 "title": "Experimental Settings",
                 "title_tooltip": "Exploratory features that may be adjusted or removed in future versions.",
+                "hide_thinking_output": "Hide Thinking Output",
+                "hide_thinking_output_tooltip": "Hides thinking text from Gemini CLI, OpenAI, and Codex responses while preserving signatures required for tool calls.",
+                "direct_non_stream": "Direct Non-stream Requests",
+                "direct_non_stream_tooltip": "Calls upstream generateContent directly when stream=false to avoid tail truncation during internal SSE collection.",
                 "enable_usage_scaling": "Enable Usage Scaling",
                 "enable_usage_scaling_tooltip": "For Claude protocol. Enables aggressive scaling when total input exceeds 30k tokens to prevent frequent client-side compression. Note: Reported usage will not reflect actual billing after enabling.",
                 "context_compression_threshold_l1": "L1 Compression Threshold (Tool Trimming)",

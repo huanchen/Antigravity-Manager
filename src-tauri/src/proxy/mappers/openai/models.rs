@@ -14,7 +14,11 @@ pub struct OpenAIRequest {
     pub stream: bool,
     #[serde(default)]
     pub n: Option<u32>, // [NEW] 支持多候选结果数量
-    #[serde(rename = "max_tokens")]
+    #[serde(
+        rename = "max_tokens",
+        alias = "max_completion_tokens",
+        alias = "max_output_tokens"
+    )]
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
     #[serde(rename = "top_p")]
@@ -59,6 +63,10 @@ pub struct ThinkingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFormat {
     pub r#type: String,
+    #[serde(default)]
+    pub json_schema: Option<Value>,
+    #[serde(default)]
+    pub schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,6 +1,148 @@
 // Gemini v1internal 包装/解包
 use serde_json::{json, Value};
 
+/// Remove user-visible thinking text while leaving non-text parts intact.
+/// Callers cache thought signatures before invoking this function.
+pub fn hide_thought_parts(response: &mut Value) {
+    if response.get("response").is_some() {
+        if let Some(payload) = response.get_mut("response") {
+            hide_thought_parts_in_payload(payload);
+        }
+    } else {
+        hide_thought_parts_in_payload(response);
+    }
+}
+
+fn hide_thought_parts_in_payload(payload: &mut Value) {
+    let Some(candidates) = payload.get_mut("candidates").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for candidate in candidates {
+        if let Some(parts) = candidate
+            .get_mut("content")
+            .and_then(|content| content.get_mut("parts"))
+            .and_then(Value::as_array_mut)
+        {
+            parts.retain(|part| {
+                let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                !(is_thought && part.get("text").is_some())
+            });
+        }
+    }
+}
+
+const ALLOWED_SAFETY_CATEGORIES: &[&str] = &[
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+    "HARM_CATEGORY_JAILBREAK",
+];
+
+const ALLOWED_SAFETY_THRESHOLDS: &[&str] = &[
+    "OFF",
+    "BLOCK_NONE",
+    "BLOCK_LOW_AND_ABOVE",
+    "BLOCK_MEDIUM_AND_ABOVE",
+    "BLOCK_ONLY_HIGH",
+    "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
+];
+
+fn normalize_enum_value(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+}
+
+fn clean_generation_response_schema(inner_request: &mut Value) {
+    let Some(request_obj) = inner_request.as_object_mut() else {
+        return;
+    };
+
+    if let Some(gen_config) = request_obj.remove("generation_config") {
+        request_obj
+            .entry("generationConfig".to_string())
+            .or_insert(gen_config);
+    }
+
+    let Some(gen_config) = inner_request
+        .get_mut("generationConfig")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+
+    if let Some(mut schema) = gen_config.remove("response_schema") {
+        crate::proxy::common::json_schema::clean_json_schema(&mut schema);
+        gen_config
+            .entry("responseSchema".to_string())
+            .or_insert(schema);
+    }
+
+    if let Some(schema) = gen_config.get_mut("responseSchema") {
+        crate::proxy::common::json_schema::clean_json_schema(schema);
+    }
+}
+
+fn clean_safety_settings(inner_request: &mut Value) {
+    let Some(obj) = inner_request.as_object_mut() else {
+        return;
+    };
+
+    let safety_value = if let Some(value) = obj.remove("safetySettings") {
+        obj.remove("safety_settings");
+        Some(value)
+    } else {
+        obj.remove("safety_settings")
+    };
+
+    let Some(Value::Array(settings)) = safety_value else {
+        return;
+    };
+
+    let mut cleaned = Vec::new();
+    let mut seen_categories = std::collections::HashSet::new();
+    for setting in settings {
+        let Value::Object(mut setting_obj) = setting else {
+            continue;
+        };
+
+        let Some(category) = setting_obj
+            .get("category")
+            .and_then(normalize_enum_value)
+        else {
+            continue;
+        };
+        if !ALLOWED_SAFETY_CATEGORIES.contains(&category.as_str()) {
+            tracing::debug!(
+                "[Gemini-Wrap] Dropping unsupported safety category: {}",
+                category
+            );
+            continue;
+        }
+        if !seen_categories.insert(category.clone()) {
+            continue;
+        }
+
+        let threshold = setting_obj
+            .get("threshold")
+            .and_then(normalize_enum_value)
+            .filter(|t| ALLOWED_SAFETY_THRESHOLDS.contains(&t.as_str()))
+            .unwrap_or_else(|| "OFF".to_string());
+
+        setting_obj.insert("category".to_string(), json!(category));
+        setting_obj.insert("threshold".to_string(), json!(threshold));
+        cleaned.push(Value::Object(setting_obj));
+    }
+
+    if !cleaned.is_empty() {
+        obj.insert("safetySettings".to_string(), Value::Array(cleaned));
+    }
+}
+
 /// 包装请求体为 v1internal 格式
 pub fn wrap_request(
     body: &Value,
@@ -35,6 +177,14 @@ pub fn wrap_request(
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
+
+    // v1internal rejects unknown safety categories instead of ignoring them.
+    clean_safety_settings(&mut inner_request);
+
+    // Gemini responseSchema only accepts the API Schema subset. Clients often send
+    // Draft 2020-12 JSON Schema from Zod/Pydantic with $defs/$ref/const, which
+    // v1internal rejects as INVALID_ARGUMENT unless flattened first.
+    clean_generation_response_schema(&mut inner_request);
 
     // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
     // Google v1internal requires 'id' for tool calls when the model is Claude,
@@ -729,6 +879,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_hide_thought_parts_preserves_answer_and_tool_call() {
+        let mut response = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [
+                            {"text": "private reasoning", "thought": true, "thoughtSignature": "sig"},
+                            {"text": "public answer"},
+                            {"functionCall": {"name": "tool", "args": {}}, "thought": true}
+                        ]
+                    }
+                }]
+            }
+        });
+
+        hide_thought_parts(&mut response);
+
+        let parts = response["response"]["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "public answer");
+        assert_eq!(parts[1]["functionCall"]["name"], "tool");
+    }
+
+    #[test]
     fn test_wrap_request() {
         let body = json!({
             "model": "gemini-2.5-flash",
@@ -739,6 +915,122 @@ mod tests {
         assert_eq!(result["project"], "test-project");
         assert_eq!(result["model"], "gemini-2.5-flash");
         assert!(result["requestId"].as_str().unwrap().starts_with("agent/"));
+    }
+
+    #[test]
+    fn test_wrap_request_cleans_response_schema_refs() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Return JSON"}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "object",
+                    "$defs": {
+                        "Step": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "const": "analysis" },
+                                "text": { "type": "string" }
+                            },
+                            "required": ["kind", "text"]
+                        }
+                    },
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/Step" }
+                        },
+                        "final": { "$ref": "#/$defs/Step" }
+                    },
+                    "required": ["steps", "final"]
+                }
+            }
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let schema = &result["request"]["generationConfig"]["responseSchema"];
+        let schema_text = serde_json::to_string(schema).unwrap();
+
+        assert!(!schema_text.contains("\"$defs\""));
+        assert!(!schema_text.contains("\"$ref\""));
+        assert!(!schema_text.contains("\"const\""));
+        assert_eq!(
+            schema["properties"]["steps"]["items"]["properties"]["text"]["type"],
+            "string"
+        );
+        assert_eq!(schema["properties"]["final"]["properties"]["text"]["type"], "string");
+    }
+
+    #[test]
+    fn test_wrap_request_normalizes_snake_case_response_schema() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Return JSON"}]}],
+            "generation_config": {
+                "response_schema": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "const": "ok" }
+                    }
+                }
+            }
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let gen_config = &result["request"]["generationConfig"];
+        let schema_text = serde_json::to_string(&gen_config["responseSchema"]).unwrap();
+
+        assert!(result["request"].get("generation_config").is_none());
+        assert!(gen_config.get("response_schema").is_none());
+        assert!(gen_config.get("responseSchema").is_some());
+        assert!(!schema_text.contains("\"const\""));
+    }
+
+    #[test]
+    fn test_wrap_request_drops_unsupported_safety_categories() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "safetySettings": [
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF" },
+                { "category": "HARM_CATEGORY_DEROGATORY", "threshold": "OFF" },
+                { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF" }
+            ]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let safety = result["request"]["safetySettings"].as_array().unwrap();
+        let categories: Vec<_> = safety
+            .iter()
+            .filter_map(|s| s["category"].as_str())
+            .collect();
+
+        assert_eq!(
+            categories,
+            vec!["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_CIVIC_INTEGRITY"]
+        );
+    }
+
+    #[test]
+    fn test_wrap_request_normalizes_snake_case_safety_settings() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "safety_settings": [
+                { "category": "harm_category_jailbreak", "threshold": "not_valid" }
+            ]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let request = &result["request"];
+
+        assert!(request.get("safety_settings").is_none());
+        assert_eq!(
+            request["safetySettings"][0]["category"],
+            "HARM_CATEGORY_JAILBREAK"
+        );
+        assert_eq!(request["safetySettings"][0]["threshold"], "OFF");
     }
 
     #[test]

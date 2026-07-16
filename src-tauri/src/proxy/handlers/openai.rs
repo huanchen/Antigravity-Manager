@@ -100,10 +100,19 @@ pub async fn handle_chat_completions(
                 messages.push(user_msg);
             }
         }
+
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("instructions");
+            obj.remove("input");
+        }
     }
 
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+    let experimental = state.experimental.read().await;
+    let hide_thinking_output = experimental.hide_thinking_output;
+    let direct_non_stream = experimental.direct_non_stream;
+    drop(experimental);
 
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {
@@ -261,7 +270,7 @@ pub async fn handle_chat_completions(
 
         // 5. 发送请求
         let client_wants_stream = openai_req.stream;
-        let force_stream_internally = !client_wants_stream;
+        let force_stream_internally = !client_wants_stream && !direct_non_stream;
         let actual_stream = client_wants_stream || force_stream_internally;
 
         if force_stream_internally {
@@ -384,6 +393,7 @@ pub async fn handle_chat_completions(
                     openai_req.model.clone(),
                     session_id,
                     message_count,
+                    hide_thinking_output,
                 );
 
                 let mut first_data_chunk = None;
@@ -520,8 +530,12 @@ pub async fn handle_chat_completions(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
-            let openai_response =
-                transform_openai_response(&gemini_resp, Some(&session_id), message_count);
+            let openai_response = transform_openai_response(
+                &gemini_resp,
+                Some(&session_id),
+                message_count,
+                hide_thinking_output,
+            );
             return Ok((
                 StatusCode::OK,
                 [
@@ -802,6 +816,11 @@ pub async fn handle_completions(
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    let experimental = state.experimental.read().await;
+    let hide_thinking_output = experimental.hide_thinking_output;
+    let direct_non_stream = experimental.direct_non_stream;
+    drop(experimental);
+
     debug!(
         "Received /v1/completions or /v1/responses payload: {:?}",
         body
@@ -859,13 +878,26 @@ pub async fn handle_completions(
         // Pass 2: Map Input Items to Messages
         if let Some(items) = input_items {
             for item in items {
-                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let item_type = if raw_item_type.is_empty()
+                    && item.get("role").is_some()
+                    && item.get("content").is_some()
+                {
+                    "message"
+                } else {
+                    raw_item_type
+                };
                 match item_type {
                     "message" => {
                         let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                        let content = item.get("content").and_then(|v| v.as_array());
+                        let content_value = item.get("content");
+                        let content = content_value.and_then(|v| v.as_array());
                         let mut text_parts = Vec::new();
                         let mut image_parts: Vec<Value> = Vec::new();
+
+                        if let Some(text) = content_value.and_then(|v| v.as_str()) {
+                            text_parts.push(text.to_string());
+                        }
 
                         if let Some(parts) = content {
                             for part in parts {
@@ -1026,13 +1058,35 @@ pub async fn handle_completions(
                             "content": output_str
                         }));
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(text) = item.as_str() {
+                            if !text.is_empty() {
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": text
+                                }));
+                            }
+                        }
+                    }
                 }
+            }
+        } else if let Some(input) = body.get("input") {
+            let content = input
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| input.to_string());
+            if !content.is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": content
+                }));
             }
         }
 
         if let Some(obj) = body.as_object_mut() {
             obj.insert("messages".to_string(), json!(messages));
+            obj.remove("instructions");
+            obj.remove("input");
         }
     } else if let Some(prompt_val) = body.get("prompt") {
         // Legacy OpenAI Style: prompt -> Chat
@@ -1263,7 +1317,7 @@ pub async fn handle_completions(
 
         // [AUTO-CONVERSION] For Legacy/Codex as well
         let client_wants_stream = openai_req.stream;
-        let force_stream_internally = !client_wants_stream;
+        let force_stream_internally = !client_wants_stream && !direct_non_stream;
         let list_response = client_wants_stream || force_stream_internally;
         let method = if list_response {
             "streamGenerateContent"
@@ -1321,6 +1375,7 @@ pub async fn handle_completions(
                             openai_req.model.clone(),
                             session_id,
                             message_count,
+                            hide_thinking_output,
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
@@ -1329,6 +1384,7 @@ pub async fn handle_completions(
                             openai_req.model.clone(),
                             session_id,
                             message_count,
+                            hide_thinking_output,
                         )
                     };
 
@@ -1408,6 +1464,7 @@ pub async fn handle_completions(
                         openai_req.model.clone(),
                         session_id,
                         message_count,
+                        hide_thinking_output,
                     );
 
                     // Peek Logic (Repeated for safety/correctness on this stream type)
@@ -1523,7 +1580,12 @@ pub async fn handle_completions(
                 }
             };
 
-            let chat_resp = transform_openai_response(&gemini_resp, Some("session-123"), 1);
+            let chat_resp = transform_openai_response(
+                &gemini_resp,
+                Some("session-123"),
+                1,
+                hide_thinking_output,
+            );
 
             // Map Chat Response -> Legacy Completions Response
             let choices = chat_resp.choices.iter().map(|c| {

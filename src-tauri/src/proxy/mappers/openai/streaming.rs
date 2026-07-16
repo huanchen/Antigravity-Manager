@@ -66,6 +66,7 @@ pub fn create_openai_sse_stream<S, E>(
     model: String,
     session_id: String,
     message_count: usize,
+    hide_thinking_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -118,8 +119,9 @@ where
                                                         for part in parts_list {
                                                             let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                                if is_thought_part { thought_out.push_str(text); }
-                                                                else { content_out.push_str(text); }
+                                                                if is_thought_part {
+                                                                    if !hide_thinking_output { thought_out.push_str(text); }
+                                                                } else { content_out.push_str(text); }
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                                 store_thought_signature(sig, &session_id, message_count);
@@ -323,6 +325,7 @@ pub fn create_legacy_sse_stream<S, E>(
     model: String,
     session_id: String,
     message_count: usize,
+    hide_thinking_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -370,7 +373,10 @@ where
                                                     if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                         for part in parts {
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                                content_out.push_str(text);
+                                                                let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                                if !is_thought || !hide_thinking_output {
+                                                                    content_out.push_str(text);
+                                                                }
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                                 store_thought_signature(sig, &session_id, message_count);
@@ -427,6 +433,7 @@ pub fn create_codex_sse_stream<S, E>(
     _model: String,
     session_id: String,
     message_count: usize,
+    hide_thinking_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -508,15 +515,16 @@ where
                                                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                             if !text.is_empty() {
                                                                 if is_thought {
-                                                                    // 思维链内容 → response.reasoning.delta
-                                                                    let reasoning_ev = json!({
-                                                                        "type": "response.reasoning.delta",
-                                                                        "item_id": &item_id,
-                                                                        "output_index": 0,
-                                                                        "content_index": 0,
-                                                                        "delta": text
-                                                                    });
-                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&reasoning_ev).unwrap())));
+                                                                    if !hide_thinking_output {
+                                                                        let reasoning_ev = json!({
+                                                                            "type": "response.reasoning.delta",
+                                                                            "item_id": &item_id,
+                                                                            "output_index": 0,
+                                                                            "content_index": 0,
+                                                                            "delta": text
+                                                                        });
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&reasoning_ev).unwrap())));
+                                                                    }
                                                                 } else {
                                                                     accumulated_text.push_str(text);
                                                                     // 4. response.output_text.delta - 文本增量
@@ -702,6 +710,7 @@ mod tests {
             "gemini-1.5-flash".to_string(),
             "test-session".to_string(),
             0,
+            false,
         );
 
         let mut chunks = Vec::new();
@@ -749,5 +758,38 @@ mod tests {
         }
         assert!(found_usage, "Usage should be found in the last chunk");
         assert!(found_finish, "Finish reason should be strictly 'stop'");
+    }
+
+    #[tokio::test]
+    async fn test_openai_stream_hides_thinking_output() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "private reasoning", "thought": true, "thoughtSignature": "sig"},
+                    {"text": "public answer"}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            chunk
+        )))];
+        let mut output = create_openai_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            true,
+        );
+
+        let mut body = String::new();
+        while let Some(item) = output.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+
+        assert!(!body.contains("private reasoning"));
+        assert!(!body.contains("reasoning_content"));
+        assert!(body.contains("public answer"));
     }
 }

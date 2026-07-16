@@ -6,6 +6,7 @@ pub fn transform_openai_response(
     gemini_response: &Value,
     session_id: Option<&str>,
     message_count: usize,
+    hide_thinking_output: bool,
 ) -> OpenAIResponse {
     // 解包 response 字段
     let raw = gemini_response.get("response").unwrap_or(gemini_response);
@@ -46,10 +47,10 @@ pub fn transform_openai_response(
                     // 文本部分
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         if is_thought_part {
-                            // thought: true 时，text 是思考内容
-                            thought_out.push_str(text);
+                            if !hide_thinking_output {
+                                thought_out.push_str(text);
+                            }
                         } else {
-                            // 正常内容
                             content_out.push_str(text);
                         }
                     }
@@ -237,7 +238,7 @@ mod tests {
             "responseId": "resp_123"
         });
 
-        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1);
+        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, false);
         assert_eq!(result.object, "chat.completion");
         let content = match result.choices[0].message.content.as_ref().unwrap() {
             OpenAIContent::String(s) => s,
@@ -264,7 +265,7 @@ mod tests {
             "responseId": "resp_123"
         });
 
-        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1);
+        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, false);
 
         assert!(result.usage.is_some());
         let usage = result.usage.unwrap();
@@ -286,7 +287,28 @@ mod tests {
             "responseId": "resp_123"
         });
 
-        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1);
+        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, false);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn test_hidden_thinking_is_not_promoted_to_content() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "private reasoning", "thought": true, "thoughtSignature": "sig"},
+                    {"text": "public answer"}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+
+        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, true);
+        assert!(result.choices[0].message.reasoning_content.is_none());
+        let content = match result.choices[0].message.content.as_ref().unwrap() {
+            OpenAIContent::String(value) => value,
+            _ => panic!("Expected string content"),
+        };
+        assert_eq!(content, "public answer");
     }
 }

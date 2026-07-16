@@ -1,0 +1,15 @@
+[Unit]
+Description=Antigravity Manager Headless Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Antigravity-Manager
+EnvironmentFile=/opt/Antigravity-Manager/.env.headless
+ExecStart=/opt/Antigravity-Manager/bin/antigravity-tools.AppImage --headless
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

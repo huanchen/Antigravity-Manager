@@ -258,6 +258,14 @@ impl Default for ZaiConfig {
 /// 实验性功能配置 (Feature Flags)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
+    /// 隐藏 Gemini thought parts / OpenAI reasoning_content，但保留签名缓存
+    #[serde(default = "default_true")]
+    pub hide_thinking_output: bool,
+
+    /// 非流式请求直接使用上游 generateContent，避免 SSE 聚合导致响应尾部丢失
+    #[serde(default = "default_true")]
+    pub direct_non_stream: bool,
+
     /// 启用双层签名缓存 (Signature Cache)
     #[serde(default = "default_true")]
     pub enable_signature_cache: bool,
@@ -292,6 +300,8 @@ pub struct ExperimentalConfig {
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
+            hide_thinking_output: true,
+            direct_non_stream: true,
             enable_signature_cache: true,
             enable_tool_loop_recovery: true,
             enable_cross_model_checks: true,

@@ -1,11 +1,14 @@
 use crate::proxy::monitor::ProxyRequestLog;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode};
 use std::path::PathBuf;
 
-const MAX_LOG_BODY_BYTES: usize = 64 * 1024;
-const MAX_LOG_ERROR_BYTES: usize = 16 * 1024;
+const MAX_LOG_BODY_BYTES: usize = 8 * 1024;
+const MAX_LOG_ERROR_BYTES: usize = 8 * 1024;
 const SQLITE_BUSY_TIMEOUT_MS: i64 = 15_000;
-const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
+const PROXY_DB_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const PROXY_DB_TARGET_BYTES: u64 = 90 * 1024 * 1024;
+const CAPACITY_TRIM_ROWS: usize = 1_000;
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
@@ -55,10 +58,80 @@ fn connect_db() -> Result<Connection, String> {
     )
     .map_err(|e| e.to_string())?;
 
+    conn.pragma_update(None, "wal_autocheckpoint", 1_000_i64)
+        .map_err(|e| e.to_string())?;
+
+    let page_size: u64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let max_pages = (PROXY_DB_MAX_BYTES / page_size).max(1);
+    conn.pragma_update(None, "max_page_count", max_pages)
+        .map_err(|e| e.to_string())?;
+
     Ok(conn)
 }
 
+fn archive_oversized_db() -> Result<Option<PathBuf>, String> {
+    let db_path = get_proxy_db_path()?;
+    let size = match std::fs::metadata(&db_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if size <= PROXY_DB_MAX_BYTES {
+        return Ok(None);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let backup_path = db_path.with_file_name(format!("proxy_logs.db.rollback-{}", timestamp));
+    std::fs::rename(&db_path, &backup_path).map_err(|e| e.to_string())?;
+
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        if sidecar.exists() {
+            let backup_sidecar = PathBuf::from(format!("{}{}", backup_path.display(), suffix));
+            if let Err(error) = std::fs::rename(&sidecar, backup_sidecar) {
+                tracing::warn!("Failed to archive proxy log sidecar {}: {}", sidecar.display(), error);
+            }
+        }
+    }
+
+    Ok(Some(backup_path))
+}
+
+fn trim_for_capacity(conn: &Connection) -> Result<usize, String> {
+    let page_size: u64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let page_count: u64 = conn
+        .pragma_query_value(None, "page_count", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let free_pages: u64 = conn
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let used_bytes = page_count.saturating_sub(free_pages) * page_size;
+
+    if used_bytes < PROXY_DB_TARGET_BYTES {
+        return Ok(0);
+    }
+
+    conn.execute(
+        "DELETE FROM request_logs WHERE id IN (
+            SELECT id FROM request_logs ORDER BY timestamp ASC LIMIT ?1
+        )",
+        [CAPACITY_TRIM_ROWS],
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn init_db() -> Result<(), String> {
+    if let Some(backup_path) = archive_oversized_db()? {
+        tracing::warn!(
+            "Archived oversized proxy log database to {} before applying the 100 MB limit",
+            backup_path.display()
+        );
+    }
+
     // connect_db will initialize WAL mode and other pragmas
     let conn = connect_db()?;
 
@@ -112,11 +185,15 @@ pub fn init_db() -> Result<(), String> {
 
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
+    let trimmed = trim_for_capacity(&conn)?;
+    if trimmed > 0 {
+        tracing::info!("Proxy log capacity cleanup removed {} oldest rows", trimmed);
+    }
     let request_body = truncate_text(&log.request_body, MAX_LOG_BODY_BYTES, "request_body");
     let response_body = truncate_text(&log.response_body, MAX_LOG_BODY_BYTES, "response_body");
     let error = truncate_text(&log.error, MAX_LOG_ERROR_BYTES, "error");
 
-    conn.execute(
+    let insert = || conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, account_email, mapped_model, protocol, client_ip, username)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
@@ -138,7 +215,22 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.client_ip,
             log.username,
         ],
-    ).map_err(|e| e.to_string())?;
+    );
+
+    match insert() {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == ErrorCode::DiskFull => {
+            conn.execute(
+                "DELETE FROM request_logs WHERE id IN (
+                    SELECT id FROM request_logs ORDER BY timestamp ASC LIMIT ?1
+                )",
+                [CAPACITY_TRIM_ROWS * 2],
+            )
+            .map_err(|e| e.to_string())?;
+            insert().map_err(|e| e.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
 
     Ok(())
 }

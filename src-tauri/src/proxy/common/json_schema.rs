@@ -201,6 +201,11 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
     match value {
         Value::Object(map) => {
+            if let Some(const_val) = map.remove("const") {
+                map.entry("enum".to_string())
+                    .or_insert_with(|| Value::Array(vec![const_val]));
+            }
+
             // 0. [NEW] 合并 allOf
             merge_all_of(map);
 
@@ -1237,6 +1242,26 @@ mod tests {
 
         // 验证 type 仍然存在
         assert_eq!(status["type"], "string");
+    }
+
+    #[test]
+    fn test_clean_const_only_schema_node() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "const": "ok"
+                }
+            }
+        });
+
+        clean_json_schema(&mut schema);
+
+        let schema_text = serde_json::to_string(&schema).unwrap();
+        let status = &schema["properties"]["status"];
+        assert!(!schema_text.contains("\"const\""));
+        assert_eq!(status["type"], "string");
+        assert_eq!(status["enum"][0], "ok");
     }
 
     // [NEW TEST] 验证多层嵌套数组的清理

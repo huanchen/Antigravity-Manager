@@ -50,6 +50,9 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     // Gemini 协议映射表
     m.insert("gemini-2.5-flash-lite", "gemini-2.5-flash");
     m.insert("gemini-2.5-flash-thinking", "gemini-2.5-flash-thinking");
+    m.insert("gemini-3.5-flash", "gemini-3-flash");
+    m.insert("gemini-3.5-flash-low", "gemini-3-flash");
+    m.insert("gemini-3.5-flash-high", "gemini-3-flash");
     // Gemini Pro family:
     // - Concrete model IDs should pass through unchanged.
     // - Generic aliases (without tier) still route to preview as fallback entrypoint.
@@ -186,16 +189,17 @@ pub async fn get_all_dynamic_models(
     model_ids.insert("gemini-3.1-pro-low".to_string());
 
     // [NEW] Issue #247: Dynamically generate all Image Gen Combinations
-    let base = "gemini-3-pro-image";
     let resolutions = vec!["", "-2k", "-4k"];
     let ratios = vec!["", "-1x1", "-4x3", "-3x4", "-16x9", "-9x16", "-21x9"];
 
-    for res in resolutions {
-        for ratio in ratios.iter() {
-            let mut id = base.to_string();
-            id.push_str(res);
-            id.push_str(ratio);
-            model_ids.insert(id);
+    for base in ["gemini-3-pro-image", "gemini-3.1-flash-image"] {
+        for res in resolutions.iter() {
+            for ratio in ratios.iter() {
+                let mut id = base.to_string();
+                id.push_str(res);
+                id.push_str(ratio);
+                model_ids.insert(id);
+            }
         }
     }
 
@@ -329,6 +333,16 @@ pub fn is_image_generation_model(model_name: &str) -> bool {
     lower.contains("image") || lower.contains("imagen")
 }
 
+fn normalize_image_model_id(lower_model_name: &str) -> String {
+    if lower_model_name.contains("gemini-3.1-flash-image") {
+        "gemini-3.1-flash-image".to_string()
+    } else if lower_model_name.contains("gemini-3-pro-image") {
+        "gemini-3-pro-image".to_string()
+    } else {
+        "gemini-3-pro-image".to_string()
+    }
+}
+
 /// Normalize a physical model name to the key used for quota/rate-limit/protection.
 /// Claude is intentionally exact: only upstream-supported Antigravity Claude
 /// model IDs are normalized, preventing unsupported Claude families from
@@ -336,9 +350,10 @@ pub fn is_image_generation_model(model_name: &str) -> bool {
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
-    // 1. image 资源 (优先匹配，使用 contains 匹配以支持任何变体，如 gemini-3.1-flash-image)
+    // 1. image resources. Keep the physical image family distinct: Flash image and
+    // Pro image have separate upstream quota buckets and reset windows.
     if is_image_generation_model(&lower) {
-        return Some("gemini-3-pro-image".to_string());
+        return Some(normalize_image_model_id(&lower));
     }
 
     // 2. gemini-3-flash (包含所有 flash 变体)
@@ -381,6 +396,10 @@ mod tests {
         assert_eq!(
             map_claude_model_to_gemini("gemini-2.5-flash-mini-test"),
             "gemini-2.5-flash-mini-test"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("gemini-3.5-flash-low"),
+            "gemini-3-flash"
         );
         assert_eq!(map_claude_model_to_gemini("unknown-model"), "unknown-model");
         // Gemini Pro concrete IDs should pass through unchanged.
@@ -449,11 +468,11 @@ mod tests {
         );
         assert_eq!(
             normalize_to_standard_id("gemini-3.1-flash-image"),
-            Some("gemini-3-pro-image".to_string())
+            Some("gemini-3.1-flash-image".to_string())
         );
         assert_eq!(
             normalize_to_standard_id("gemini-3.1-flash-image-4k"),
-            Some("gemini-3-pro-image".to_string())
+            Some("gemini-3.1-flash-image".to_string())
         );
     }
 

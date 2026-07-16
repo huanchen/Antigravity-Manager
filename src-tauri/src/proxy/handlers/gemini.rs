@@ -79,8 +79,11 @@ pub async fn handle_generate(
         .await;
     }
     let client_wants_stream = method == "streamGenerateContent";
-    // [AUTO-CONVERSION] 强制内部流式化
-    let force_stream_internally = !client_wants_stream;
+    let experimental = state.experimental.read().await;
+    let hide_thinking_output = experimental.hide_thinking_output;
+    let direct_non_stream = experimental.direct_non_stream;
+    drop(experimental);
+    let force_stream_internally = !client_wants_stream && !direct_non_stream;
     let is_stream = client_wants_stream || force_stream_internally;
 
     if force_stream_internally {
@@ -156,14 +159,18 @@ pub async fn handle_generate(
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
+    let mut force_rotate_next = false;
 
     for attempt in 0..max_attempts {
+        let force_rotate = force_rotate_next;
+        force_rotate_next = false;
+
         // 4. 获取 Token (使用准确的 request_type)
-        // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
+        // 关键：根据上一轮错误策略决定是否强制轮换账号。
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
                 &config.request_type,
-                attempt > 0,
+                force_rotate,
                 Some(&session_id),
                 &config.final_model,
             )
@@ -284,6 +291,7 @@ pub async fn handle_generate(
                     max_attempts,
                     e
                 );
+                force_rotate_next = true;
                 continue;
             }
         };
@@ -398,6 +406,7 @@ pub async fn handle_generate(
                 }
 
                 if retry_gemini {
+                    force_rotate_next = true;
                     continue;
                 }
 
@@ -502,6 +511,10 @@ pub async fn handle_generate(
 
                                             // [FIX #1522] Inject Tool ID into Stream Response
                                             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &model_name_for_stream);
+
+                                            if hide_thinking_output {
+                                                crate::proxy::mappers::gemini::wrapper::hide_thought_parts(&mut json);
+                                            }
 
                                             // Unwrap v1internal response wrapper
                                             if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
@@ -616,6 +629,10 @@ pub async fn handle_generate(
                 }
             }
 
+            if hide_thinking_output {
+                crate::proxy::mappers::gemini::wrapper::hide_thought_parts(&mut gemini_resp);
+            }
+
             let unwrapped = unwrap_response(&gemini_resp);
             return Ok((
                 StatusCode::OK,
@@ -630,6 +647,11 @@ pub async fn handle_generate(
 
         // 处理错误并重试
         let status_code = status.as_u16();
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
         let error_text = response
             .text()
             .await
@@ -656,6 +678,18 @@ pub async fn handle_generate(
                 &payload,
             )
             .await;
+        }
+
+        if !is_image_request && matches!(status_code, 429 | 529 | 503 | 500 | 404) {
+            token_manager
+                .mark_rate_limited_async(
+                    &email,
+                    status_code,
+                    retry_after.as_deref(),
+                    &error_text,
+                    Some(&mapped_model),
+                )
+                .await;
         }
 
         if is_image_request && matches!(status_code, 500 | 503 | 529) {
@@ -692,8 +726,15 @@ pub async fn handle_generate(
                 Some(&mapped_model),
                 Some(&error_text),
             );
+            force_rotate_next = true;
             continue;
         }
+
+        let is_signature_repair = status_code == 400
+            && (error_text.contains("Invalid `signature`")
+                || error_text.contains("thinking.signature")
+                || error_text.contains("Invalid signature")
+                || error_text.contains("Corrupted thought signature"));
 
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
@@ -721,26 +762,26 @@ pub async fn handle_generate(
             }
 
             // 判断是否需要轮换账号
-            // 判断是否需要轮换账号
-            let mut force_rotate = false;
-            if !should_rotate_account(status_code, Some(&strategy)) {
+            force_rotate_next = should_rotate_account(status_code, Some(&strategy));
+            if !force_rotate_next {
                 debug!(
-                "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
-                trace_id, status_code
-            );
-                force_rotate = false;
+                    "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
+                    trace_id, status_code
+                );
             } else {
-                force_rotate = true;
+                debug!(
+                    "[{}] Rotating account for retry after status {}",
+                    trace_id, status_code
+                );
+            }
+
+            if !is_signature_repair {
+                continue;
             }
         }
 
         // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
-            && (error_text.contains("Invalid `signature`")
-                || error_text.contains("thinking.signature")
-                || error_text.contains("Invalid signature")
-                || error_text.contains("Corrupted thought signature"))
-        {
+        if is_signature_repair {
             tracing::warn!(
                 "[Gemini] Signature error detected on account {}, retrying without thinking",
                 email
