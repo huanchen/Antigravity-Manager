@@ -2,7 +2,9 @@ use crate::proxy::monitor::ProxyRequestLog;
 use rusqlite::{params, Connection, ErrorCode};
 use std::path::PathBuf;
 
-const MAX_LOG_BODY_BYTES: usize = 8 * 1024;
+// Keep enough request/response data for long SSE diagnostics without allowing
+// individual monitor records to grow without bound.
+const MAX_LOG_BODY_BYTES: usize = 256 * 1024;
 const MAX_LOG_ERROR_BYTES: usize = 8 * 1024;
 const SQLITE_BUSY_TIMEOUT_MS: i64 = 15_000;
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
