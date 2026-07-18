@@ -296,6 +296,40 @@ pub async fn monitor_middleware(
                         // Claude/Anthropic format: content_block_start, content_block_delta, etc.
                         let msg_type = json.get("type").and_then(|t| t.as_str());
                         match msg_type {
+                            // OpenAI Responses/Codex SSE format
+                            Some("response.output_text.delta") => {
+                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                                    response_content.push_str(delta);
+                                }
+                            }
+                            Some("response.reasoning.delta") => {
+                                if let Some(delta) = json.get("delta").and_then(|v| v.as_str()) {
+                                    thinking_content.push_str(delta);
+                                }
+                            }
+                            Some("response.completed") => {
+                                if let Some(usage) = json
+                                    .get("response")
+                                    .and_then(|response| response.get("usage"))
+                                {
+                                    log.input_tokens = usage
+                                        .get("input_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v as u32);
+                                    log.output_tokens = usage
+                                        .get("output_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|v| v as u32);
+                                }
+                            }
+                            Some("response.failed") => {
+                                log.error = json
+                                    .get("response")
+                                    .and_then(|response| response.get("error"))
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(|message| message.as_str())
+                                    .map(|message| message.to_string());
+                            }
                             Some("content_block_start") => {
                                 if let (Some(index), Some(block)) = (
                                     json.get("index").and_then(|i| i.as_u64()),

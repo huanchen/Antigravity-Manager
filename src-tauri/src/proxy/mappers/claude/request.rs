@@ -61,7 +61,6 @@ fn build_safety_settings() -> Value {
         { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": threshold_str },
         { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": threshold_str },
         { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": threshold_str },
-        { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": threshold_str },
     ])
 }
 
@@ -2106,6 +2105,20 @@ mod tests {
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::{update_thinking_budget_config, ThinkingBudgetConfig};
+
+    #[test]
+    fn test_generated_safety_settings_use_v1internal_compatible_categories() {
+        let settings = build_safety_settings();
+        let categories: Vec<&str> = settings
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|setting| setting.get("category").and_then(Value::as_str))
+            .collect();
+
+        assert_eq!(categories.len(), 4);
+        assert!(!categories.contains(&"HARM_CATEGORY_CIVIC_INTEGRITY"));
+    }
 
     #[test]
     fn test_ephemeral_injection_debug() {

@@ -1390,6 +1390,7 @@ pub async fn handle_completions(
 
                     // [P1 FIX] Enhanced Peek logic (Reused from above/standard)
                     let mut first_data_chunk = None;
+                    let mut preamble_chunks: Vec<Bytes> = Vec::new();
                     let mut retry_this_account = false;
 
                     loop {
@@ -1408,6 +1409,52 @@ pub async fn handle_completions(
                                     || text.trim().starts_with("data: :")
                                 {
                                     continue;
+                                }
+
+                                // Responses API streams begin with protocol preamble events
+                                // before Gemini has produced any candidate. Do not let those
+                                // events satisfy the first-byte probe, otherwise an empty
+                                // upstream stream is returned as an empty successful response.
+                                if is_codex_style {
+                                    let event = text
+                                        .trim()
+                                        .strip_prefix("data: ")
+                                        .and_then(|data| serde_json::from_str::<Value>(data).ok());
+                                    let event_type = event
+                                        .as_ref()
+                                        .and_then(|value| value.get("type"))
+                                        .and_then(Value::as_str);
+                                    if matches!(
+                                        event_type,
+                                        Some(
+                                            "response.created"
+                                                | "response.output_item.added"
+                                                | "response.content_part.added"
+                                        )
+                                    ) {
+                                        preamble_chunks.push(bytes);
+                                        continue;
+                                    }
+                                    if event_type == Some("response.completed") {
+                                        let has_text = event
+                                            .as_ref()
+                                            .and_then(|value| value.pointer("/response/output"))
+                                            .and_then(Value::as_array)
+                                            .map(|output| {
+                                                output.iter().any(|item| {
+                                                    item.pointer("/content/0/text")
+                                                        .and_then(Value::as_str)
+                                                        .map(|text| !text.is_empty())
+                                                        .unwrap_or(false)
+                                                })
+                                            })
+                                            .unwrap_or(false);
+                                        if !has_text {
+                                            last_error = "Empty Responses API output".to_string();
+                                            retry_this_account = true;
+                                            break;
+                                        }
+                                    }
                                 }
                                 if text.contains("\"error\"") {
                                     last_error = "Error event during peek".to_string();
@@ -1439,10 +1486,16 @@ pub async fn handle_completions(
                         continue;
                     }
 
-                    let combined_stream = futures::stream::once(async move {
-                        Ok::<Bytes, String>(first_data_chunk.unwrap())
-                    })
-                    .chain(openai_stream);
+                    let preamble_stream = futures::stream::iter(
+                        preamble_chunks
+                            .into_iter()
+                            .map(Ok::<Bytes, String>),
+                    );
+                    let combined_stream = preamble_stream
+                        .chain(futures::stream::once(async move {
+                            Ok::<Bytes, String>(first_data_chunk.unwrap())
+                        }))
+                        .chain(openai_stream);
 
                     return Response::builder()
                         .header("Content-Type", "text/event-stream")
@@ -2011,7 +2064,6 @@ pub async fn handle_images_generations_internal(
                             { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
                             { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
                             { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF" },
                         ]
                     }
                 });
@@ -2421,7 +2473,6 @@ pub async fn handle_images_edits(
                             { "category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF" },
                             { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF" },
                             { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF" },
-                            { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF" },
                         ]
                     }
                 });

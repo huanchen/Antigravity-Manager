@@ -515,6 +515,7 @@ pub async fn handle_messages(
     // [NEW] 获取上下文控制配置
     let experimental = state.experimental.read().await;
     let scaling_enabled = experimental.enable_usage_scaling;
+    let direct_non_stream = experimental.direct_non_stream;
     let threshold_l1 = experimental.context_compression_threshold_l1;
     let threshold_l2 = experimental.context_compression_threshold_l2;
     let threshold_l3 = experimental.context_compression_threshold_l3;
@@ -1045,8 +1046,9 @@ pub async fn handle_messages(
 
         // 4. 上游调用 - 自动转换逻辑
         let client_wants_stream = request.stream;
-        // [AUTO-CONVERSION] 非 Stream 请求自动转换为 Stream 以享受更宽松的配额
-        let force_stream_internally = !client_wants_stream;
+        // Keep non-stream requests on the native JSON endpoint when enabled. The
+        // SSE conversion remains available for clients that explicitly stream.
+        let force_stream_internally = !client_wants_stream && !direct_non_stream;
         let actual_stream = client_wants_stream || force_stream_internally;
 
         if force_stream_internally {

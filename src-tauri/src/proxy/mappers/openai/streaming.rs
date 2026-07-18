@@ -485,6 +485,8 @@ where
 
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
+        let mut final_usage: Option<super::models::OpenAIUsage> = None;
+        let mut upstream_error: Option<String> = None;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -504,6 +506,9 @@ where
 
                                     if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                        if let Some(usage) = actual_data.get("usageMetadata") {
+                                            final_usage = extract_usage_metadata(usage);
+                                        }
                                         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
                                             if candidates.len() > 0 {
                                                 tracing::debug!("[Codex-Stream-Debug] Raw Candidate: {:?}", candidates[0]);
@@ -594,12 +599,32 @@ where
                                 }
                             }
                         }
-                        Some(Err(_)) => break,
+                        Some(Err(error)) => {
+                            upstream_error = Some(error.to_string());
+                            break;
+                        }
                         None => break,
                     }
                 }
                 _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
             }
+        }
+
+        if let Some(error) = upstream_error {
+            let failed_ev = json!({
+                "type": "response.failed",
+                "response": {
+                    "id": &response_id,
+                    "object": "response",
+                    "status": "failed",
+                    "error": {
+                        "type": "upstream_error",
+                        "message": error
+                    }
+                }
+            });
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&failed_ev).unwrap())));
+            return;
         }
 
         // 5. response.output_text.done - 文本完成
@@ -643,12 +668,18 @@ where
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_done).unwrap())));
 
         // 8. response.completed
+        let responses_usage = final_usage.as_ref().map(|usage| json!({
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens
+        }));
         let completed_ev = json!({
             "type": "response.completed",
             "response": {
                 "id": &response_id,
                 "object": "response",
                 "status": "completed",
+                "usage": responses_usage,
                 "output": [{
                     "id": &item_id,
                     "type": "message",
