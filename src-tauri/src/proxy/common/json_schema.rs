@@ -231,6 +231,29 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 }
             }
 
+            // Gemini's Schema proto requires the structural fields to agree
+            // with `type`. Some JSON Schema producers emit array nodes with
+            // `properties`, or omit `items` entirely. Prefer the structure and
+            // make every array declaration valid for v1internal.
+            let has_properties = map.contains_key("properties");
+            let has_items = map.contains_key("items");
+            let declared_type = map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value.to_ascii_lowercase());
+
+            if has_properties {
+                map.insert("type".to_string(), Value::String("object".to_string()));
+            } else if has_items || declared_type.as_deref() == Some("array") {
+                map.insert("type".to_string(), Value::String("array".to_string()));
+                if !has_items {
+                    map.insert(
+                        "items".to_string(),
+                        json!({ "type": "string" }),
+                    );
+                }
+            }
+
             // 1. [CRITICAL] 深度递归处理子项
             // 处理 properties (对象)
             if let Some(Value::Object(props)) = map.get_mut("properties") {
@@ -282,6 +305,18 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
             // (JSON Schema allows boolean `items`, Gemini's Schema proto rejects it).
             if map.get("items").map(|i| !i.is_object()).unwrap_or(false) {
                 map.remove("items");
+            }
+            if map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case("array"))
+                .unwrap_or(false)
+                && !map.contains_key("items")
+            {
+                map.insert(
+                    "items".to_string(),
+                    json!({ "type": "string" }),
+                );
             }
             if let Some(items) = map.get_mut("items") {
                 // items 的内容必须是一个独立的 Schema 节点
@@ -1687,5 +1722,36 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Accepts: string | object"));
+    }
+
+    #[test]
+    fn test_normalizes_gemini_array_shapes() {
+        let mut schema = json!({
+            "type": "OBJECT",
+            "properties": {
+                "rrule": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "byday": { "type": "ARRAY", "properties": {} },
+                        "bymonth": { "type": "ARRAY" }
+                    }
+                },
+                "script_args": { "type": "ARRAY", "items": true }
+            }
+        });
+
+        clean_json_schema(&mut schema);
+
+        let byday = &schema["properties"]["rrule"]["properties"]["byday"];
+        assert_eq!(byday["type"], "object");
+        assert!(byday.get("items").is_none());
+
+        let bymonth = &schema["properties"]["rrule"]["properties"]["bymonth"];
+        assert_eq!(bymonth["type"], "array");
+        assert_eq!(bymonth["items"]["type"], "string");
+
+        let script_args = &schema["properties"]["script_args"];
+        assert_eq!(script_args["type"], "array");
+        assert_eq!(script_args["items"]["type"], "string");
     }
 }
