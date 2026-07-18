@@ -434,6 +434,7 @@ pub fn create_codex_sse_stream<S, E>(
     session_id: String,
     message_count: usize,
     hide_thinking_output: bool,
+    fallback_input_tokens: u32,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -668,11 +669,56 @@ where
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_done).unwrap())));
 
         // 8. response.completed
-        let responses_usage = final_usage.as_ref().map(|usage| json!({
+        let fallback_output_tokens = {
+            let (ascii, non_ascii) = accumulated_text.chars().fold(
+                (0_u32, 0_u32),
+                |(ascii, non_ascii), ch| {
+                    if ch.is_ascii() {
+                        (ascii + 1, non_ascii)
+                    } else {
+                        (ascii, non_ascii + 1)
+                    }
+                },
+            );
+            non_ascii.saturating_add(ascii.saturating_add(3) / 4).max(1)
+        };
+        let mut usage = final_usage.unwrap_or(super::models::OpenAIUsage {
+            prompt_tokens: fallback_input_tokens.max(1),
+            completion_tokens: fallback_output_tokens,
+            total_tokens: fallback_input_tokens
+                .max(1)
+                .saturating_add(fallback_output_tokens),
+            prompt_tokens_details: Some(super::models::PromptTokensDetails {
+                cached_tokens: Some(0),
+            }),
+            completion_tokens_details: None,
+        });
+        if usage.prompt_tokens == 0 {
+            usage.prompt_tokens = fallback_input_tokens.max(1);
+        }
+        if usage.completion_tokens == 0 {
+            usage.completion_tokens = fallback_output_tokens;
+        }
+        usage.total_tokens = usage
+            .total_tokens
+            .max(usage.prompt_tokens.saturating_add(usage.completion_tokens));
+        let cached_tokens = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or(0);
+        let reasoning_tokens = usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+            .unwrap_or(0);
+        let responses_usage = json!({
             "input_tokens": usage.prompt_tokens,
+            "input_tokens_details": { "cached_tokens": cached_tokens },
             "output_tokens": usage.completion_tokens,
+            "output_tokens_details": { "reasoning_tokens": reasoning_tokens },
             "total_tokens": usage.total_tokens
-        }));
+        });
         let completed_ev = json!({
             "type": "response.completed",
             "response": {
@@ -822,5 +868,43 @@ mod tests {
         assert!(!body.contains("private reasoning"));
         assert!(!body.contains("reasoning_content"));
         assert!(body.contains("public answer"));
+    }
+
+    #[tokio::test]
+    async fn test_codex_stream_falls_back_to_non_zero_responses_usage() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "fallback usage"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            chunk
+        )))];
+        let mut output = create_codex_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            true,
+            123,
+        );
+
+        let mut completed = None;
+        while let Some(item) = output.next().await {
+            let chunk = String::from_utf8_lossy(&item.unwrap()).to_string();
+            for line in chunk.lines().filter(|line| line.starts_with("data: ")) {
+                let event: Value = serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
+                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    completed = Some(event);
+                }
+            }
+        }
+
+        let usage = completed.unwrap()["response"]["usage"].clone();
+        assert_eq!(usage["input_tokens"], 123);
+        assert!(usage["output_tokens"].as_u64().unwrap() > 0);
+        assert!(usage["total_tokens"].as_u64().unwrap() > 123);
     }
 }

@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info}; // Import Engine trait for encode method
 
 use crate::proxy::mappers::openai::{
-    transform_openai_request, transform_openai_response, OpenAIRequest,
+    transform_openai_request, transform_openai_response, OpenAIRequest, OpenAIResponse,
+    OpenAIUsage, PromptTokensDetails,
 };
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
 use crate::proxy::debug_logger;
@@ -16,6 +17,142 @@ use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
+
+fn estimate_tokens_from_text(text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let (ascii, non_ascii) = text.chars().fold((0_u32, 0_u32), |(ascii, non_ascii), ch| {
+        if ch.is_ascii() {
+            (ascii + 1, non_ascii)
+        } else {
+            (ascii, non_ascii + 1)
+        }
+    });
+
+    non_ascii.saturating_add(ascii.saturating_add(3) / 4).max(1)
+}
+
+fn estimate_openai_request_tokens(request: &OpenAIRequest) -> u32 {
+    serde_json::to_string(request)
+        .map(|value| estimate_tokens_from_text(&value))
+        .unwrap_or(1)
+}
+
+fn ensure_openai_usage(response: &mut OpenAIResponse, fallback_input_tokens: u32) {
+    let fallback_output_tokens = serde_json::to_string(&response.choices)
+        .map(|value| estimate_tokens_from_text(&value))
+        .unwrap_or(1);
+
+    match response.usage.as_mut() {
+        Some(usage) => {
+            if usage.prompt_tokens == 0 {
+                usage.prompt_tokens = fallback_input_tokens.max(1);
+            }
+            if usage.completion_tokens == 0 {
+                usage.completion_tokens = fallback_output_tokens.max(1);
+            }
+            usage.total_tokens = usage
+                .total_tokens
+                .max(usage.prompt_tokens.saturating_add(usage.completion_tokens));
+        }
+        None => {
+            let prompt_tokens = fallback_input_tokens.max(1);
+            let completion_tokens = fallback_output_tokens.max(1);
+            response.usage = Some(OpenAIUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(0),
+                }),
+                completion_tokens_details: None,
+            });
+        }
+    }
+}
+
+fn transform_to_responses_api(response: &OpenAIResponse) -> Value {
+    let mut output = Vec::new();
+
+    if let Some(choice) = response.choices.first() {
+        let text = match choice.message.content.as_ref() {
+            Some(crate::proxy::mappers::openai::OpenAIContent::String(text)) => text.clone(),
+            Some(crate::proxy::mappers::openai::OpenAIContent::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    crate::proxy::mappers::openai::OpenAIContentBlock::Text { text } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        };
+
+        if !text.is_empty() || choice.message.tool_calls.is_none() {
+            output.push(json!({
+                "id": format!("msg_{}", response.id),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }]
+            }));
+        }
+
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            for tool_call in tool_calls {
+                output.push(json!({
+                    "id": tool_call.id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments
+                }));
+            }
+        }
+    }
+
+    let usage = response.usage.as_ref().map(|usage| {
+        let cached_tokens = usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or(0);
+        let reasoning_tokens = usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+            .unwrap_or(0);
+
+        json!({
+            "input_tokens": usage.prompt_tokens,
+            "input_tokens_details": { "cached_tokens": cached_tokens },
+            "output_tokens": usage.completion_tokens,
+            "output_tokens_details": { "reasoning_tokens": reasoning_tokens },
+            "total_tokens": usage.total_tokens
+        })
+    });
+
+    json!({
+        "id": response.id,
+        "object": "response",
+        "created_at": response.created,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "model": response.model,
+        "output": output,
+        "usage": usage
+    })
+}
 use super::common::{
     acquire_global_image_permit, acquire_image_account_permit, apply_retry_strategy,
     determine_retry_strategy, image_max_attempts, is_retryable_image_error,
@@ -1228,6 +1365,10 @@ pub async fn handle_completions(
             });
     }
 
+    // Gemini normally supplies usageMetadata. Keep a protocol-compatible
+    // fallback for upstream variants that omit or zero those fields.
+    let fallback_input_tokens = estimate_openai_request_tokens(&openai_req);
+
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
@@ -1376,6 +1517,7 @@ pub async fn handle_completions(
                             session_id,
                             message_count,
                             hide_thinking_output,
+                            fallback_input_tokens,
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
@@ -1577,7 +1719,22 @@ pub async fn handle_completions(
                     // Collect
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
                     match collect_stream_to_json(Box::pin(combined_stream)).await {
-                        Ok(chat_resp) => {
+                        Ok(mut chat_resp) => {
+                            ensure_openai_usage(&mut chat_resp, fallback_input_tokens);
+
+                            if is_codex_style {
+                                let responses_resp = transform_to_responses_api(&chat_resp);
+                                return (
+                                    StatusCode::OK,
+                                    [
+                                        ("X-Account-Email", email.as_str()),
+                                        ("X-Mapped-Model", mapped_model.as_str()),
+                                    ],
+                                    Json(responses_resp),
+                                )
+                                    .into_response();
+                            }
+
                             // NOW: Convert Chat Response -> Legacy Response (Same logic as below)
                             let choices = chat_resp.choices.iter().map(|c| {
                                 json!({
@@ -1633,12 +1790,27 @@ pub async fn handle_completions(
                 }
             };
 
-            let chat_resp = transform_openai_response(
+            let mut chat_resp = transform_openai_response(
                 &gemini_resp,
                 Some("session-123"),
                 1,
                 hide_thinking_output,
             );
+
+            ensure_openai_usage(&mut chat_resp, fallback_input_tokens);
+
+            if is_codex_style {
+                let responses_resp = transform_to_responses_api(&chat_resp);
+                return (
+                    StatusCode::OK,
+                    [
+                        ("X-Account-Email", email.as_str()),
+                        ("X-Mapped-Model", mapped_model.as_str()),
+                    ],
+                    Json(responses_resp),
+                )
+                    .into_response();
+            }
 
             // Map Chat Response -> Legacy Completions Response
             let choices = chat_resp.choices.iter().map(|c| {
@@ -2641,4 +2813,44 @@ pub async fn handle_images_edits(
         Json(openai_response),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod responses_usage_tests {
+    use super::*;
+    use crate::proxy::mappers::openai::{Choice, OpenAIContent, OpenAIMessage};
+
+    fn sample_response(usage: Option<OpenAIUsage>) -> OpenAIResponse {
+        OpenAIResponse {
+            id: "resp_test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1,
+            model: "gemini-test".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: Some(OpenAIContent::String("answer".to_string())),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage,
+        }
+    }
+
+    #[test]
+    fn test_responses_sync_usage_is_standard_and_non_zero() {
+        let mut response = sample_response(None);
+        ensure_openai_usage(&mut response, 321);
+        let responses = transform_to_responses_api(&response);
+
+        assert_eq!(responses["object"], "response");
+        assert_eq!(responses["usage"]["input_tokens"], 321);
+        assert!(responses["usage"]["output_tokens"].as_u64().unwrap() > 0);
+        assert!(responses["usage"]["total_tokens"].as_u64().unwrap() > 321);
+    }
 }
