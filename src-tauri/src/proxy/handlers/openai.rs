@@ -1527,6 +1527,7 @@ pub async fn handle_completions(
                             session_id,
                             message_count,
                             hide_thinking_output,
+                            fallback_input_tokens,
                         )
                     };
 

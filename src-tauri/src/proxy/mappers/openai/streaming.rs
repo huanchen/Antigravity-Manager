@@ -61,6 +61,72 @@ fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
     })
 }
 
+fn fallback_usage_for_text(text: &str, input_tokens: u32) -> super::models::OpenAIUsage {
+    let (ascii, non_ascii) = text.chars().fold((0_u32, 0_u32), |(ascii, non_ascii), ch| {
+        if ch.is_ascii() { (ascii + 1, non_ascii) } else { (ascii, non_ascii + 1) }
+    });
+    let output_tokens = non_ascii.saturating_add(ascii.saturating_add(3) / 4).max(1);
+    let input_tokens = input_tokens.max(1);
+    super::models::OpenAIUsage {
+        prompt_tokens: input_tokens,
+        completion_tokens: output_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        prompt_tokens_details: Some(super::models::PromptTokensDetails { cached_tokens: Some(0) }),
+        completion_tokens_details: None,
+    }
+}
+
+fn parse_codex_trailing_event(
+    raw_line: &str,
+) -> Option<(Vec<(String, bool)>, Option<super::models::OpenAIUsage>, bool)> {
+    let line = raw_line.trim();
+    let json_part = line.strip_prefix("data: ")?.trim();
+    if json_part == "[DONE]" {
+        return Some((Vec::new(), None, true));
+    }
+
+    let mut json = serde_json::from_str::<Value>(json_part).ok()?;
+    let actual_data = if let Some(inner) = json.get_mut("response").map(|value| value.take()) {
+        inner
+    } else {
+        json
+    };
+    let usage = actual_data
+        .get("usageMetadata")
+        .and_then(extract_usage_metadata);
+    let mut saw_marker = usage.is_some();
+    let mut texts = Vec::new();
+
+    if let Some(candidate) = actual_data
+        .get("candidates")
+        .and_then(|value| value.as_array())
+        .and_then(|candidates| candidates.first())
+    {
+        saw_marker |= candidate.get("finishReason").is_some()
+            || candidate.get("finish_reason").is_some();
+        if let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(|parts| parts.as_array())
+        {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                    if !text.is_empty() {
+                        texts.push((
+                            text.to_string(),
+                            part.get("thought")
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(false),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Some((texts, usage, saw_marker))
+}
+
 pub fn create_openai_sse_stream<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     model: String,
@@ -326,6 +392,7 @@ pub fn create_legacy_sse_stream<S, E>(
     session_id: String,
     message_count: usize,
     hide_thinking_output: bool,
+    fallback_input_tokens: u32,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -345,7 +412,9 @@ where
 
     let stream = async_stream::stream! {
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
+        let mut accumulated_text = String::new();
         let mut error_occurred = false;
+        let mut saw_completion_marker = false;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -365,7 +434,10 @@ where
                                         if json_part == "[DONE]" { continue; }
                                         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                             let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
-                                            if let Some(u) = actual_data.get("usageMetadata") { final_usage = extract_usage_metadata(u); }
+                                            if let Some(u) = actual_data.get("usageMetadata") {
+                                                final_usage = extract_usage_metadata(u);
+                                                saw_completion_marker = true;
+                                            }
 
                                             let mut content_out = String::new();
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -389,13 +461,19 @@ where
                                             let finish_reason = actual_data.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.get(0)).and_then(|c| c.get("finishReason")).and_then(|f| f.as_str()).map(|f| match f {
                                                 "STOP" => "stop", "MAX_TOKENS" => "length", "SAFETY" => "content_filter", _ => f,
                                             });
+                                            saw_completion_marker |= finish_reason.is_some();
 
                                             let mut legacy_chunk = json!({
                                                 "id": &stream_id, "object": "text_completion", "created": created_ts, "model": &model,
                                                 "choices": [{ "text": content_out, "index": 0, "logprobs": null, "finish_reason": finish_reason }]
                                             });
-                                            if let Some(ref usage) = final_usage { legacy_chunk["usage"] = serde_json::to_value(usage).unwrap(); }
-                                            if finish_reason.is_some() { final_usage = None; }
+                                            accumulated_text.push_str(&content_out);
+                                            if finish_reason.is_some() {
+                                                let usage = final_usage
+                                                    .take()
+                                                    .unwrap_or_else(|| fallback_usage_for_text(&accumulated_text, fallback_input_tokens));
+                                                legacy_chunk["usage"] = serde_json::to_value(usage).unwrap();
+                                            }
                                             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&legacy_chunk).unwrap_or_default())));
                                         }
                                     }
@@ -420,6 +498,61 @@ where
                 }
                 _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
             }
+        }
+        // Flush a terminal SSE event that arrived without a trailing newline.
+        if !buffer.is_empty() {
+            if let Ok(line_str) = std::str::from_utf8(&buffer) {
+                let line = line_str.trim();
+                if let Some(json_part) = line.strip_prefix("data: ") {
+                    if json_part.trim() != "[DONE]" {
+                        if let Ok(mut json) = serde_json::from_str::<Value>(json_part.trim()) {
+                            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                            if let Some(u) = actual_data.get("usageMetadata") {
+                                final_usage = extract_usage_metadata(u);
+                                saw_completion_marker = true;
+                            }
+                            let candidate = actual_data.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.first());
+                            let mut content_out = String::new();
+                            if let Some(parts) = candidate.and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                for part in parts {
+                                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                        if !part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) || !hide_thinking_output { content_out.push_str(text); }
+                                    }
+                                }
+                            }
+                            let finish_reason = candidate.and_then(|c| c.get("finishReason")).and_then(|f| f.as_str()).map(|f| match f { "STOP" => "stop", "MAX_TOKENS" => "length", "SAFETY" => "content_filter", _ => f });
+                            saw_completion_marker |= finish_reason.is_some();
+                            if finish_reason.is_some() || !content_out.is_empty() {
+                                accumulated_text.push_str(&content_out);
+                                let mut legacy_chunk = json!({ "id": &stream_id, "object": "text_completion", "created": created_ts, "model": &model, "choices": [{ "text": content_out, "index": 0, "logprobs": null, "finish_reason": finish_reason }] });
+                                if finish_reason.is_some() {
+                                    let usage = final_usage.take().unwrap_or_else(|| fallback_usage_for_text(&accumulated_text, fallback_input_tokens));
+                                    legacy_chunk["usage"] = serde_json::to_value(usage).unwrap();
+                                }
+                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&legacy_chunk).unwrap_or_default())));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !error_occurred && !saw_completion_marker {
+            tracing::warn!("[Legacy-Stream] Upstream ended before finish marker; refusing silent success");
+            let error_chunk = json!({
+                "id": &stream_id,
+                "object": "text_completion",
+                "created": created_ts,
+                "model": &model,
+                "choices": [],
+                "error": {
+                    "type": "incomplete_upstream_stream",
+                    "message": "Upstream stream ended before a finish marker",
+                    "code": "incomplete_upstream_stream"
+                }
+            });
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
+            yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+            error_occurred = true;
         }
         if !error_occurred {
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
@@ -488,6 +621,7 @@ where
         let mut accumulated_text = String::new();
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut upstream_error: Option<String> = None;
+        let mut saw_completion_marker = false;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -509,12 +643,18 @@ where
                                         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
                                         if let Some(usage) = actual_data.get("usageMetadata") {
                                             final_usage = extract_usage_metadata(usage);
+                                            saw_completion_marker = true;
                                         }
                                         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
                                             if candidates.len() > 0 {
                                                 tracing::debug!("[Codex-Stream-Debug] Raw Candidate: {:?}", candidates[0]);
                                             }
                                             if let Some(candidate) = candidates.get(0) {
+                                                if candidate.get("finishReason").is_some()
+                                                    || candidate.get("finish_reason").is_some()
+                                                {
+                                                    saw_completion_marker = true;
+                                                }
                                                 if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                     for part in parts {
                                                         let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -611,6 +751,43 @@ where
             }
         }
 
+        // The final SSE event can arrive without a trailing newline. Do not
+        // discard that buffered event when the upstream connection closes.
+        if !buffer.is_empty() {
+            if let Ok(line) = std::str::from_utf8(&buffer) {
+                if let Some((texts, usage, marker)) = parse_codex_trailing_event(line) {
+                    if let Some(usage) = usage {
+                        final_usage = Some(usage);
+                    }
+                    saw_completion_marker |= marker;
+                    for (text, is_thought) in texts {
+                        if is_thought {
+                            if !hide_thinking_output {
+                                let reasoning_ev = json!({
+                                    "type": "response.reasoning.delta",
+                                    "item_id": &item_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": text
+                                });
+                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&reasoning_ev).unwrap())));
+                            }
+                        } else {
+                            accumulated_text.push_str(&text);
+                            let delta_ev = json!({
+                                "type": "response.output_text.delta",
+                                "item_id": &item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": text
+                            });
+                            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&delta_ev).unwrap())));
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(error) = upstream_error {
             let failed_ev = json!({
                 "type": "response.failed",
@@ -625,6 +802,24 @@ where
                 }
             });
             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&failed_ev).unwrap())));
+            return;
+        }
+
+        if !saw_completion_marker {
+            let incomplete_ev = json!({
+                "type": "response.failed",
+                "response": {
+                    "id": &response_id,
+                    "object": "response",
+                    "status": "failed",
+                    "error": {
+                        "type": "incomplete_upstream_stream",
+                        "message": "Upstream stream ended before a finish marker"
+                    }
+                }
+            });
+            tracing::warn!("[Codex-Stream] Upstream ended before finish marker; refusing completed response");
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&incomplete_ev).unwrap())));
             return;
         }
 
@@ -738,6 +933,7 @@ where
             }
         });
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&completed_ev).unwrap())));
+        yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
     };
     Box::pin(stream)
 }
@@ -895,6 +1091,9 @@ mod tests {
         while let Some(item) = output.next().await {
             let chunk = String::from_utf8_lossy(&item.unwrap()).to_string();
             for line in chunk.lines().filter(|line| line.starts_with("data: ")) {
+                if line.trim() == "data: [DONE]" {
+                    continue;
+                }
                 let event: Value = serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
                 if event.get("type").and_then(Value::as_str) == Some("response.completed") {
                     completed = Some(event);
@@ -906,5 +1105,91 @@ mod tests {
         assert_eq!(usage["input_tokens"], 123);
         assert!(usage["output_tokens"].as_u64().unwrap() > 0);
         assert!(usage["total_tokens"].as_u64().unwrap() > 123);
+    }
+
+    #[tokio::test]
+    async fn test_codex_stream_flushes_final_event_without_newline() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "tail survives"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from(format!(
+            "data: {}",
+            chunk
+        )))];
+        let mut output = create_codex_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            true,
+            10,
+        );
+
+        let mut body = String::new();
+        while let Some(item) = output.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+
+        assert!(body.contains("tail survives"));
+        assert!(body.contains("response.completed"));
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_stream_emits_usage_without_gemini_usage_metadata() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "OK"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            chunk
+        )))];
+        let mut output = create_legacy_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3.5-flash-low".to_string(),
+            "test-session".to_string(),
+            0,
+            true,
+            7,
+        );
+        let mut body = String::new();
+        while let Some(item) = output.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.contains("\"prompt_tokens\":7"));
+        assert!(body.contains("\"completion_tokens\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_stream_reports_incomplete_eof() {
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [{"text": "partial"}]}}]
+        });
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            chunk
+        )))];
+        let mut output = create_legacy_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3.5-flash-low".to_string(),
+            "test-session".to_string(),
+            0,
+            true,
+            7,
+        );
+        let mut body = String::new();
+        while let Some(item) = output.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+        assert!(body.contains("partial"));
+        assert!(body.contains("incomplete_upstream_stream"));
+        assert!(!body.contains("\"finish_reason\":\"stop\""));
     }
 }
