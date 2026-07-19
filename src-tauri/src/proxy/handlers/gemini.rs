@@ -23,6 +23,28 @@ use axum::http::HeaderMap;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 
+fn ensure_gemini_stream_usage(
+    output: &mut Value,
+    fallback_input_tokens: u32,
+    output_chars: u32,
+) -> bool {
+    let has_finish = output
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .map(|c| c.get("finishReason").is_some() || c.get("finish_reason").is_some())
+        .unwrap_or(false);
+    if has_finish && output.get("usageMetadata").is_none() {
+        let output_tokens = (output_chars.saturating_add(3) / 4).max(1);
+        output["usageMetadata"] = json!({
+            "promptTokenCount": fallback_input_tokens.max(1),
+            "candidatesTokenCount": output_tokens,
+            "totalTokenCount": fallback_input_tokens.max(1).saturating_add(output_tokens)
+        });
+    }
+    has_finish
+}
+
 /// 处理 generateContent 和 streamGenerateContent
 /// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
 pub async fn handle_generate(
@@ -367,6 +389,10 @@ pub async fn handle_generate(
                 );
                 let mut buffer = BytesMut::new();
                 let s_id = session_id.clone(); // Clone for stream closure
+                let fallback_input_tokens = serde_json::to_string(&body)
+                    .map(|s| (s.len() as u32).saturating_add(3) / 4)
+                    .unwrap_or(1)
+                    .max(1);
 
                 // [FIX #859] Implement peek logic for Gemini stream to prevent 0-token 200 OK
                 let mut first_chunk = None;
@@ -415,6 +441,9 @@ pub async fn handle_generate(
                 let stream = async_stream::stream! {
                     let mut first_data = first_chunk;
                     let mut meta_sent = false;
+                    let mut saw_completion_marker = false;
+                    let mut stream_failed = false;
+                    let mut output_chars = 0_u32;
 
                     loop {
                         // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
@@ -464,7 +493,14 @@ pub async fn handle_generate(
                                 });
                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
                                 yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+                                stream_failed = true;
                                 break;
+                            }
+                            None if !buffer.is_empty() => {
+                                // Process the final SSE event even when upstream omitted
+                                // its trailing newline.
+                                buffer.extend_from_slice(b"\n");
+                                Bytes::new()
                             }
                             None => break,
                         };
@@ -509,6 +545,23 @@ pub async fn handle_generate(
                                                 }
                                             }
 
+                                            if let Some(resp) = json.get("response").or(Some(&json)) {
+                                                if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
+                                                    if let Some(candidate) = candidates.first() {
+                                                        if candidate.get("finishReason").is_some() || candidate.get("finish_reason").is_some() {
+                                                            saw_completion_marker = true;
+                                                        }
+                                                        if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                                            for part in parts {
+                                                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                                    output_chars = output_chars.saturating_add(text.chars().count() as u32);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             // [FIX #1522] Inject Tool ID into Stream Response
                                             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &model_name_for_stream);
 
@@ -516,12 +569,21 @@ pub async fn handle_generate(
                                                 crate::proxy::mappers::gemini::wrapper::hide_thought_parts(&mut json);
                                             }
 
-                                            // Unwrap v1internal response wrapper
-                                            if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                                                let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
-                                                yield Ok::<Bytes, String>(Bytes::from(new_line));
+                                            // Unwrap v1internal response wrapper and add usage for clients
+                                            // (such as sub2api) that bill from Gemini usageMetadata.
+                                            let mut output_json = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+                                                inner
                                             } else {
-                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&json).unwrap_or_default())));
+                                                json
+                                            };
+                                            ensure_gemini_stream_usage(
+                                                &mut output_json,
+                                                fallback_input_tokens,
+                                                output_chars,
+                                            );
+                                            {
+                                                let new_line = format!("data: {}\n\n", serde_json::to_string(&output_json).unwrap_or_default());
+                                                yield Ok::<Bytes, String>(Bytes::from(new_line));
                                             }
                                         }
                                         Err(e) => {
@@ -539,6 +601,15 @@ pub async fn handle_generate(
                                 yield Ok::<Bytes, String>(line_raw.freeze());
                             }
                         }
+                    }
+                    if !saw_completion_marker && !stream_failed {
+                        let error_json = json!({
+                            "error": {
+                                "code": 500,
+                                "message": "Upstream stream ended before a finishReason"
+                            }
+                        });
+                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
                     }
                 };
 
@@ -898,4 +969,39 @@ pub async fn handle_count_tokens(
         })?;
 
     Ok(Json(json!({"totalTokens": 0})))
+}
+
+#[cfg(test)]
+mod stream_usage_tests {
+    use super::*;
+
+    #[test]
+    fn adds_usage_to_finished_stream_event() {
+        let mut event = json!({"candidates": [{"finishReason": "STOP"}]});
+        assert!(ensure_gemini_stream_usage(&mut event, 20, 8));
+        assert_eq!(event["usageMetadata"]["promptTokenCount"], 20);
+        assert_eq!(event["usageMetadata"]["candidatesTokenCount"], 2);
+        assert_eq!(event["usageMetadata"]["totalTokenCount"], 22);
+    }
+
+    #[test]
+    fn preserves_upstream_usage() {
+        let mut event = json!({
+            "candidates": [{"finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 130
+            }
+        });
+        assert!(ensure_gemini_stream_usage(&mut event, 1, 1));
+        assert_eq!(event["usageMetadata"]["totalTokenCount"], 130);
+    }
+
+    #[test]
+    fn does_not_add_usage_before_finish() {
+        let mut event = json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]});
+        assert!(!ensure_gemini_stream_usage(&mut event, 20, 7));
+        assert!(event.get("usageMetadata").is_none());
+    }
 }
