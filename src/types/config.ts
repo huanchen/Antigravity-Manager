@@ -112,6 +112,10 @@ export interface PinnedQuotaModelsConfig {
 }
 
 export interface ExperimentalConfig {
+    /** Hide model thought/reasoning text while retaining signatures and usage. */
+    hide_thinking_output?: boolean;
+    /** Use the upstream non-streaming endpoint for stream=false requests. */
+    direct_non_stream?: boolean;
     enable_usage_scaling: boolean;
     compression_level?: string;
     context_compression_threshold_l1?: number;

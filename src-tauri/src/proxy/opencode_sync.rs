@@ -2794,7 +2794,13 @@ mod tests {
     fn test_sync_uses_frontend_display_name_for_unknown_model() {
         let config = serde_json::json!({});
         let models_to_sync = [
-            minput_named("gemini-3.5-flash-low", "Gemini 3.5 Flash (High)"),
+            // Use a genuinely unknown account-specific variant. The documented
+            // `gemini-3.5-flash-low` id is now a canonical family alias and is
+            // intentionally normalized before OpenCode sync.
+            minput_named(
+                "gemini-3.5-flash-custom",
+                "Gemini 3.5 Flash Custom (High)",
+            ),
             minput_named("gemini-3-flash-agent", "Gemini 3 Flash Agent"),
         ];
 
@@ -2818,11 +2824,11 @@ mod tests {
         // The display name must be used as-is, preserving parentheses/variant info.
         assert_eq!(
             models
-                .get("gemini-3.5-flash-low")
+                .get("gemini-3.5-flash-custom")
                 .unwrap()
                 .get("name")
                 .unwrap(),
-            "Gemini 3.5 Flash (High)"
+            "Gemini 3.5 Flash Custom (High)"
         );
         assert_eq!(
             models
@@ -2836,7 +2842,7 @@ mod tests {
         // And because these are gemini-3.x ids, they should also get series defaults.
         assert!(
             models
-                .get("gemini-3.5-flash-low")
+                .get("gemini-3.5-flash-custom")
                 .unwrap()
                 .get("limit")
                 .is_some(),
@@ -2970,9 +2976,12 @@ pub async fn get_opencode_config_content(
         .unwrap_or_else(|_| Err("Failed to read config".to_string()))
 }
 
-/// List of Antigravity model IDs that may have been added to legacy providers
+/// Model IDs that may have been added to legacy providers by this app.
+/// Keep historical IDs here so "clear" can remove them, even when they are no
+/// longer advertised in the active catalog.
 const ANTIGRAVITY_MODEL_IDS: &[&str] = &[
     "claude-sonnet-4-6",
+    "claude-opus-4-6-thinking",
     "claude-sonnet-4-6-thinking",
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-thinking",

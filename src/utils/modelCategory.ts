@@ -2,7 +2,24 @@
  * 模型分类工具函数（无 React / icons 依赖，可在 Node 环境直接导入）
  */
 
-export type ModelCategory = 'gemini-pro' | 'gemini-flash' | 'gemini-pro-image' | 'gemini-flash-image' | 'claude' | 'other';
+export type ModelCategory =
+    | 'gemini-pro'
+    | 'gemini-flash'
+    | 'gemini-pro-image'
+    | 'gemini-flash-image'
+    | 'claude-sonnet'
+    | 'claude-opus'
+    | 'claude'
+    | 'other';
+
+/** Canonical quota buckets exposed by the upstream Claude account API. */
+export const CLAUDE_SONNET_QUOTA_MODEL = 'claude-sonnet-4-6' as const;
+export const CLAUDE_OPUS_QUOTA_MODEL = 'claude-opus-4-6-thinking' as const;
+export const LEGACY_CLAUDE_QUOTA_MODEL = 'claude' as const;
+export const SUPPORTED_CLAUDE_QUOTA_MODELS = [
+    CLAUDE_SONNET_QUOTA_MODEL,
+    CLAUDE_OPUS_QUOTA_MODEL,
+] as const;
 
 export function categorizeModel(name: string): ModelCategory {
     const n = name.trim().toLowerCase();
@@ -11,7 +28,11 @@ export function categorizeModel(name: string): ModelCategory {
     if (isImage) return n.includes('flash') ? 'gemini-flash-image' : 'gemini-pro-image';
     if (isGemini && n.includes('flash')) return 'gemini-flash';
     if (isGemini && n.includes('pro')) return 'gemini-pro';
-    if (n.includes('claude') || n.includes('opus') || n.includes('sonnet') || n.includes('haiku')) return 'claude';
+    // Keep Sonnet and Opus in separate quota buckets. Generic Claude/Haiku
+    // names remain in the legacy category for old configs and aliases.
+    if (n.includes('opus')) return 'claude-opus';
+    if (n.includes('sonnet')) return 'claude-sonnet';
+    if (n.includes('claude') || n.includes('haiku')) return 'claude';
     return 'other';
 }
 
@@ -42,7 +63,9 @@ export function findQuotaModel<T extends { name: string }>(
     const preferred: Partial<Record<ModelCategory, string[]>> = {
         'gemini-pro': ['gemini-pro-agent', 'gemini-3.1-pro-high', 'gemini-3.1-pro', 'gemini-3.1-pro-low', 'gemini-2.5-pro'],
         'gemini-flash': ['gemini-3-flash-agent', 'gemini-3-flash', 'gemini-3.5-flash'],
-        'claude': ['claude-sonnet-4-6', 'claude-opus-4-6-thinking'],
+        'claude-sonnet': [CLAUDE_SONNET_QUOTA_MODEL, 'claude-sonnet-4-6-thinking'],
+        'claude-opus': [CLAUDE_OPUS_QUOTA_MODEL, 'claude-opus-4-6'],
+        'claude': [CLAUDE_SONNET_QUOTA_MODEL, CLAUDE_OPUS_QUOTA_MODEL],
     };
     const names = preferred[category];
     if (names) {
@@ -60,9 +83,48 @@ export function getModelProtectionKey(name: string): string | null {
         case 'gemini-pro': return 'gemini-3-pro-high';
         case 'gemini-flash-image': return 'gemini-3.1-flash-image';
         case 'gemini-pro-image': return 'gemini-3-pro-image';
-        case 'claude': return 'claude';
+        case 'claude-sonnet': return CLAUDE_SONNET_QUOTA_MODEL;
+        case 'claude-opus': return CLAUDE_OPUS_QUOTA_MODEL;
+        case 'claude': return LEGACY_CLAUDE_QUOTA_MODEL;
         default: return null;
     }
+}
+
+export function isSupportedClaudeQuotaModel(name: string): boolean {
+    const normalized = name.trim().toLowerCase();
+    return (SUPPORTED_CLAUDE_QUOTA_MODELS as readonly string[]).includes(normalized);
+}
+
+/**
+ * Check a model against account protection markers while retaining support for
+ * old account files that stored one `claude` marker for both Claude buckets.
+ */
+export function isQuotaModelProtected(
+    protectedModels: readonly string[] | undefined,
+    modelName: string,
+): boolean {
+    if (!protectedModels || protectedModels.length === 0) return false;
+
+    const normalizedModel = modelName.trim().toLowerCase();
+    const targetKey = getModelProtectionKey(normalizedModel) ?? normalizedModel;
+    const targetCategory = categorizeModel(normalizedModel);
+
+    return protectedModels.some((marker) => {
+        const normalizedMarker = marker.trim().toLowerCase();
+        if (normalizedMarker === targetKey || normalizedMarker === normalizedModel) return true;
+
+        // Legacy generic marker is intentionally broad for the two supported
+        // Claude buckets, but does not make unrelated models protected.
+        if (
+            normalizedMarker === LEGACY_CLAUDE_QUOTA_MODEL
+            && (targetCategory === 'claude-sonnet' || targetCategory === 'claude-opus')
+        ) {
+            return true;
+        }
+
+        const markerKey = getModelProtectionKey(normalizedMarker);
+        return markerKey !== null && markerKey === targetKey;
+    });
 }
 
 /**
@@ -106,7 +168,16 @@ export function resolveQuotaModels<T extends { name: string }>(
     const seen = new Set<string>();
     const results: QuotaModelSelection<T>[] = [];
 
-    for (const selectorId of selectorIds) {
+    // Older settings used one `claude` selector. Expand it into two physical
+    // selectors so one depleted bucket never masks the other.
+    const expandedSelectorIds = selectorIds.flatMap((selectorId) => {
+        const normalized = selectorId.trim().toLowerCase();
+        return normalized === LEGACY_CLAUDE_QUOTA_MODEL
+            ? [...SUPPORTED_CLAUDE_QUOTA_MODELS]
+            : [selectorId];
+    });
+
+    for (const selectorId of expandedSelectorIds) {
         const normalizedId = selectorId.trim().toLowerCase();
         const category = categorizeModel(normalizedId);
 
@@ -122,7 +193,7 @@ export function resolveQuotaModels<T extends { name: string }>(
 
         const model = isImage
             ? findImageQuotaModel(models)
-            : category === 'other'
+            : category === 'other' || category === 'claude'
                 ? models?.find(m => m.name.trim().toLowerCase() === normalizedId)
                 : findQuotaModel(models, category);
 

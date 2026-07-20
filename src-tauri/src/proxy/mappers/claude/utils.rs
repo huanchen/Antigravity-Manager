@@ -25,6 +25,7 @@ pub fn to_claude_usage(
 ) -> super::models::Usage {
     let prompt_tokens = usage_metadata.prompt_token_count.unwrap_or(0);
     let cached_tokens = usage_metadata.cached_content_token_count.unwrap_or(0);
+    let output_tokens = usage_metadata.output_token_count();
 
     // 【改进的智能阈值回归算法】
     // 目标：既利用 Gemini 大窗口，又能在高用量时让 Claude Code 正确触发 compact 提示
@@ -98,7 +99,7 @@ pub fn to_claude_usage(
 
     super::models::Usage {
         input_tokens: reported_input,
-        output_tokens: usage_metadata.candidates_token_count.unwrap_or(0),
+        output_tokens,
         cache_read_input_tokens: reported_cache,
         cache_creation_input_tokens: Some(0),
         server_tool_use: None,
@@ -119,6 +120,7 @@ mod tests {
         let usage = UsageMetadata {
             prompt_token_count: Some(100),
             candidates_token_count: Some(50),
+            thoughts_token_count: None,
             total_token_count: Some(150),
             cached_content_token_count: None,
         };
@@ -132,6 +134,7 @@ mod tests {
         let usage_50 = UsageMetadata {
             prompt_token_count: Some(500_000),
             candidates_token_count: Some(10),
+            thoughts_token_count: None,
             total_token_count: Some(500_010),
             cached_content_token_count: None,
         };
@@ -143,6 +146,7 @@ mod tests {
         let usage_70 = UsageMetadata {
             prompt_token_count: Some(700_000),
             candidates_token_count: Some(10),
+            thoughts_token_count: None,
             total_token_count: Some(700_010),
             cached_content_token_count: None,
         };
@@ -154,6 +158,7 @@ mod tests {
         let usage_85 = UsageMetadata {
             prompt_token_count: Some(850_000),
             candidates_token_count: Some(10),
+            thoughts_token_count: None,
             total_token_count: Some(850_010),
             cached_content_token_count: None,
         };
@@ -165,11 +170,77 @@ mod tests {
         let usage_100 = UsageMetadata {
             prompt_token_count: Some(1_000_000),
             candidates_token_count: Some(10),
+            thoughts_token_count: None,
             total_token_count: Some(1_000_010),
             cached_content_token_count: None,
         };
         let res_100 = to_claude_usage(&usage_100, true, 1_000_000);
         // 97% of 195k = 189,150
         assert!(res_100.input_tokens > 185_000 && res_100.input_tokens <= 190_000);
+    }
+
+    #[test]
+    fn gemini_thought_tokens_are_included_in_anthropic_output() {
+        use super::super::models::UsageMetadata;
+
+        let usage = UsageMetadata {
+            prompt_token_count: Some(105),
+            candidates_token_count: Some(6),
+            thoughts_token_count: Some(118),
+            total_token_count: Some(229),
+            cached_content_token_count: None,
+        };
+
+        let result = to_claude_usage(&usage, false, 1_000_000);
+        assert_eq!(result.input_tokens, 105);
+        assert_eq!(result.output_tokens, 124);
+    }
+
+    #[test]
+    fn gemini_thought_only_usage_does_not_report_zero_output() {
+        use super::super::models::UsageMetadata;
+
+        let usage = UsageMetadata {
+            prompt_token_count: Some(105),
+            candidates_token_count: None,
+            thoughts_token_count: Some(125),
+            total_token_count: Some(230),
+            cached_content_token_count: None,
+        };
+
+        let result = to_claude_usage(&usage, false, 1_000_000);
+        assert_eq!(result.output_tokens, 125);
+    }
+
+    #[test]
+    fn inclusive_candidate_count_is_not_double_counted() {
+        use super::super::models::UsageMetadata;
+
+        let usage = UsageMetadata {
+            prompt_token_count: Some(100),
+            candidates_token_count: Some(50),
+            thoughts_token_count: Some(20),
+            total_token_count: Some(150),
+            cached_content_token_count: None,
+        };
+
+        let result = to_claude_usage(&usage, false, 1_000_000);
+        assert_eq!(result.output_tokens, 50);
+    }
+
+    #[test]
+    fn placeholder_zero_totals_do_not_erase_real_output() {
+        use super::super::models::UsageMetadata;
+
+        let usage = UsageMetadata {
+            prompt_token_count: Some(0),
+            candidates_token_count: Some(10),
+            thoughts_token_count: Some(286),
+            total_token_count: Some(0),
+            cached_content_token_count: None,
+        };
+
+        let result = to_claude_usage(&usage, false, 1_000_000);
+        assert_eq!(result.output_tokens, 296);
     }
 }

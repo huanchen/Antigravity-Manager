@@ -500,6 +500,12 @@ pub fn transform_claude_request_in(
         || mapped_model.contains("gemini-2.0-pro")
         || (mapped_model.contains("gemini-3-pro") && !mapped_model.contains("-high") && !mapped_model.contains("-low"))
         || (mapped_model.contains("gemini-3.1-pro") && !mapped_model.contains("-high") && !mapped_model.contains("-low"))
+        // Resolved variant checkpoints (low/medium/high/agent) are thinking
+        // models too; generic aliases may be normalized to one of these IDs.
+        || (mapped_model.starts_with("gemini-")
+            && ["-thinking", "-low", "-medium", "-high", "-agent"]
+                .iter()
+                .any(|suffix| mapped_model.ends_with(suffix)))
         // [FIX #2167] gemini-*-flash 支持 thinking，必须纳入识别范围
         || (mapped_model.contains("gemini") && (mapped_model.contains("flash") || mapped_model.contains("-flash-")));
 
@@ -754,18 +760,6 @@ fn should_enable_thinking_by_default(model: &str) -> bool {
     {
         tracing::debug!(
             "[Thinking-Mode] Auto-enabling thinking for Gemini Pro model: {}",
-            model
-        );
-        return true;
-    }
-
-    // [FEATURE] 为 gemini-*-flash 自动开启 thinking
-    // 让 Cherry Studio 等客户端即使未显式传 thinking.type 也能获取思维链内容
-    if model_lower.contains("gemini")
-        && (model_lower.contains("flash") || model_lower.contains("-flash-"))
-    {
-        tracing::debug!(
-            "[Thinking-Mode] Auto-enabling thinking for Flash model: {}",
             model
         );
         return true;
@@ -1999,10 +1993,26 @@ fn build_generation_config(
     // max_tokens 映射为 maxOutputTokens
     // [FIX] 不再默认设置 81920，防止非思维模型 (如 claude-sonnet-4-6) 报 400 Invalid Argument
     let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
+    // Anthropic clients may omit max_tokens when they target a Gemini-backed
+    // model. Letting v1internal choose its small implicit default is a common
+    // source of apparently truncated replies; use the account-aware model cap
+    // while keeping Claude's native no-cap behavior unchanged.
+    let model_lower = mapped_model.to_lowercase();
+    if final_max_tokens.is_none()
+        && model_lower.contains("gemini")
+        && !crate::proxy::common::model_mapping::is_image_generation_model(&model_lower)
+    {
+        let default_limit = crate::proxy::model_specs::get_max_output_tokens(mapped_model, token);
+        final_max_tokens = Some(default_limit as i64);
+        tracing::debug!(
+            "[Generation-Config] Defaulting maxOutputTokens to {} for Anthropic-format Gemini model {}",
+            default_limit,
+            mapped_model
+        );
+    }
 
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
     // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    let model_lower = mapped_model.to_lowercase();
     // 重新计算 should_use_adaptive (因为上面定义的作用域仅在其 if 块内有效，或者我们可以假设在这里也需要同样的逻辑)
     // 但为了简洁和解耦，我们这里重新从 config 读取
     let tb_config_chk = crate::proxy::config::get_thinking_budget_config();
@@ -2022,7 +2032,10 @@ fn build_generation_config(
 
     // [FIX #2007] Opus 4.6 Thinking Alignment
     // OpenAI logs show maxOutputTokens = 57344 (24576 + 32768)
-    if model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled {
+    if model_lower.contains("claude-opus-4-6-thinking")
+        && is_thinking_enabled
+        && final_max_tokens.is_none()
+    {
         final_max_tokens = Some(57344);
         tracing::debug!("[Opus-Alignment] Enforcing maxOutputTokens 57344 for Opus 4.6");
     }
@@ -2063,15 +2076,33 @@ fn build_generation_config(
     if let Some(val) = final_max_tokens {
         // [FIX] Cap maxOutputTokens to 65536 to avoid INVALID_ARGUMENT (Cherry Studio sends 128000)
         // Gemini models typically support max 8192 or 65536 output tokens. 128k is usually invalid.
-        let safe_limit = 65536;
+        let safe_limit = crate::proxy::model_specs::get_max_output_tokens(mapped_model, token)
+            .min(65536) as i64;
+        let effective_max = val.min(safe_limit);
         if val > safe_limit {
             tracing::warn!(
                 "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
                 val, safe_limit
             );
-            config["maxOutputTokens"] = json!(safe_limit);
+            config["maxOutputTokens"] = json!(effective_max);
         } else {
-            config["maxOutputTokens"] = json!(val);
+            config["maxOutputTokens"] = json!(effective_max);
+        }
+
+        if let Some(thinking) = config
+            .get_mut("thinkingConfig")
+            .and_then(Value::as_object_mut)
+        {
+            let budget = thinking
+                .get("thinkingBudget")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if effective_max > 0 && budget >= effective_max as u64 {
+                thinking.insert(
+                    "thinkingBudget".to_string(),
+                    json!(effective_max.saturating_sub(1).max(1)),
+                );
+            }
         }
     }
 
@@ -2161,6 +2192,12 @@ mod tests {
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
     use crate::proxy::config::{update_thinking_budget_config, ThinkingBudgetConfig};
+    use std::sync::Mutex;
+
+    // These request-conversion tests exercise a process-global thinking-budget
+    // setting. Serialize the tests that read/write it so an adaptive test cannot
+    // change the mode halfway through a neighboring assertion.
+    static THINKING_CONFIG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_ephemeral_injection_debug() {
@@ -2795,6 +2832,8 @@ mod tests {
     }
     #[test]
     fn test_default_max_tokens() {
+        let _config_guard = THINKING_CONFIG_TEST_LOCK.lock().unwrap();
+        update_thinking_budget_config(ThinkingBudgetConfig::default());
         let req = ClaudeRequest {
             model: "claude-3-opus".to_string(),
             messages: vec![Message {
@@ -2817,16 +2856,50 @@ mod tests {
 
         let result =
             transform_claude_request_in(&req, "test-v", false, None, "test_session", None).unwrap();
-        // [FIX] Since we removed the default 81920, maxOutputTokens should NOT be present
-        // when max_tokens is None and thinking is disabled
+        // This legacy Claude 3 model is not one of the auto-thinking models.
+        // With no client max_tokens, leave the provider default untouched.
         let gen_config = &result["request"]["generationConfig"];
         assert!(
             gen_config.get("maxOutputTokens").is_none(),
             "maxOutputTokens should not be set when max_tokens is None"
         );
     }
+
+    #[test]
+    fn test_gemini_anthropic_request_gets_account_aware_default_max_tokens() {
+        let req = ClaudeRequest {
+            model: "gemini-3-flash".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Write a long answer".to_string()),
+            }],
+            system: None,
+            tools: None,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+        };
+
+        let result =
+            transform_claude_request_in(&req, "test-v", false, None, "test_session", None)
+                .expect("request conversion");
+        assert_eq!(
+            result["request"]["generationConfig"]["maxOutputTokens"],
+            65536
+        );
+    }
+
     #[test]
     fn test_claude_flash_thinking_budget_capping() {
+        let _config_guard = THINKING_CONFIG_TEST_LOCK.lock().unwrap();
+        update_thinking_budget_config(ThinkingBudgetConfig::default());
         // Use full path or ensure import of ThinkingConfig
         // transform_claude_request and models are needed.
         // Assuming models are available via super imports, but let's be explicit if needed.
@@ -2894,6 +2967,8 @@ mod tests {
 
     #[test]
     fn test_gemini_pro_thinking_support() {
+        let _config_guard = THINKING_CONFIG_TEST_LOCK.lock().unwrap();
+        update_thinking_budget_config(ThinkingBudgetConfig::default());
         // Setup request for Gemini Pro (no -thinking suffix)
         let req = ClaudeRequest {
             model: "gemini-3-pro-preview".to_string(),
@@ -2939,6 +3014,8 @@ mod tests {
 
     #[test]
     fn test_gemini_pro_default_thinking() {
+        let _config_guard = THINKING_CONFIG_TEST_LOCK.lock().unwrap();
+        update_thinking_budget_config(ThinkingBudgetConfig::default());
         // Setup request for Gemini Pro WITHOUT thinking config
         let req = ClaudeRequest {
             model: "gemini-3-pro-preview".to_string(),
@@ -3020,6 +3097,7 @@ mod tests {
 
     #[test]
     fn test_claude_adaptive_global_config() {
+        let _config_guard = THINKING_CONFIG_TEST_LOCK.lock().unwrap();
         // Set global config to Adaptive + High effort
         let config = ThinkingBudgetConfig {
             mode: crate::proxy::config::ThinkingBudgetMode::Adaptive,
@@ -3057,15 +3135,18 @@ mod tests {
         let gen_config = result["request"]["generationConfig"].as_object().unwrap();
         let thinking_config = gen_config["thinkingConfig"].as_object().unwrap();
 
-        // Check injection
+        // Adaptive is represented with a provider-safe thinking level for
+        // Claude/Vertex requests. It must not emit Gemini's `-1` sentinel or
+        // an Anthropic-only `effort` field.
         assert_eq!(thinking_config["includeThoughts"], true);
-        assert_eq!(thinking_config["thinkingBudget"], -1);
+        assert_eq!(thinking_config["thinkingLevel"], "high");
+        assert!(thinking_config.get("thinkingBudget").is_none());
         assert!(thinking_config.get("thinkingType").is_none());
         assert!(thinking_config.get("effort").is_none());
 
         // Check maxOutputTokens default for adaptive
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        assert_eq!(max_output_tokens, 131072);
+        assert_eq!(max_output_tokens, 64000);
 
         // Reset global config
         crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());

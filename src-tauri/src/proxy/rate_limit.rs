@@ -104,14 +104,87 @@ impl RateLimitTracker {
     /// 当账号成功完成请求后调用此方法，将其失败计数归零，
     /// 这样下次失败时会从最短的锁定时间（60秒）开始。
     pub fn mark_success(&self, account_id: &str) {
-        if self.failure_counts.remove(account_id).is_some() {
-            tracing::debug!("账号 {} 请求成功，已重置失败计数", account_id);
+        // Without model context, only clear account-wide state. Model-scoped
+        // locks belong to their individual quota bucket and must survive a
+        // successful request for another model.
+        let prefix = format!("{}:", account_id);
+        let mut removed_failure_count = self.failure_counts.remove(account_id).is_some();
+        self.failure_counts.retain(|key, _| {
+            let account_scoped = key
+                .strip_prefix(&prefix)
+                .is_some_and(|suffix| !suffix.contains(':'));
+            if account_scoped {
+                removed_failure_count = true;
+            }
+            !account_scoped
+        });
+        let removed_lock = self.limits.remove(account_id).is_some();
+        if removed_failure_count || removed_lock {
+            tracing::debug!("账号 {} 请求成功，已重置账号级限流状态", account_id);
         }
-        // 清除账号级限流
-        self.limits.remove(account_id);
-        // 注意：我们暂时无法清除该账号下的所有模型级锁，因为我们不知道哪些模型被锁了
-        // 除非遍历 limits。考虑到模型级锁通常是 QuotaExhausted，让其自然过期也是可以接受的。
-        // 或者我们可以引入索引，但为了简单，暂时只清除 Account 级锁。
+    }
+
+    /// Clear the account-wide state and the lock/failure state for one model.
+    ///
+    /// Upstream handlers normally pass a mapped model ID, while older callers
+    /// may have recorded a physical alias. Remove both the raw and normalized
+    /// keys, but never touch another model's key.
+    pub fn mark_success_for_model(&self, account_id: &str, model: &str) {
+        let model = model.trim();
+        if model.is_empty() {
+            self.mark_success(account_id);
+            return;
+        }
+
+        let mut model_keys = vec![self.get_limit_key(account_id, Some(model))];
+        if let Some(normalized) = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+        {
+            let normalized_key = self.get_limit_key(account_id, Some(&normalized));
+            if !model_keys.iter().any(|key| key == &normalized_key) {
+                model_keys.push(normalized_key);
+            }
+        }
+
+        let account_prefix = format!("{}:", account_id);
+        let mut removed_failure_count = self.failure_counts.remove(account_id).is_some();
+        // Account-scoped counters are encoded as `<account>:<reason>`; model
+        // counters have one additional colon (`<account>:<model>:<reason>`).
+        self.failure_counts.retain(|key, _| {
+            let account_scoped = key
+                .strip_prefix(&account_prefix)
+                .is_some_and(|suffix| !suffix.contains(':'));
+            if account_scoped {
+                removed_failure_count = true;
+            }
+            !account_scoped
+        });
+        // Model-specific failure counters are keyed as `<account:model>:<reason>`.
+        for model_key in &model_keys {
+            let prefix = format!("{}:", model_key);
+            self.failure_counts.retain(|key, _| {
+                let keep = !key.starts_with(&prefix);
+                if !keep {
+                    removed_failure_count = true;
+                }
+                keep
+            });
+        }
+
+        let removed_account_lock = self.limits.remove(account_id).is_some();
+        let mut removed_model_lock = false;
+        for model_key in model_keys {
+            if self.limits.remove(&model_key).is_some() {
+                removed_model_lock = true;
+            }
+        }
+
+        if removed_failure_count || removed_account_lock || removed_model_lock {
+            tracing::debug!(
+                "账号 {} 的模型 {} 请求成功，已重置对应限流状态",
+                account_id,
+                model
+            );
+        }
     }
 
     /// 精确锁定账号到指定时间点
@@ -129,21 +202,10 @@ impl RateLimitTracker {
         model: Option<String>,
     ) {
         let now = SystemTime::now();
-        let mut retry_sec = reset_time
+        let retry_sec = reset_time
             .duration_since(now)
             .map(|d| d.as_secs())
             .unwrap_or(60); // 如果时间已过,使用默认 60 秒
-
-        if retry_sec > 300 {
-            tracing::info!(
-                "Capping lockout time for {} from {}s to 300s (5 minutes)",
-                account_id,
-                retry_sec
-            );
-            retry_sec = 300;
-        }
-
-        let reset_time = now + Duration::from_secs(retry_sec);
 
         let info = RateLimitInfo {
             reset_time,
@@ -235,7 +297,15 @@ impl RateLimitTracker {
             );
             RateLimitReason::ServerError
         } else {
-            RateLimitReason::ServerError
+            // A 503/529 may still be a model-capacity response. Keep that lock
+            // model-scoped so an Opus outage does not suppress Sonnet on the same
+            // account.
+            let parsed = self.parse_rate_limit_reason(body);
+            if matches!(parsed, RateLimitReason::ModelCapacityExhausted) {
+                parsed
+            } else {
+                RateLimitReason::ServerError
+            }
         };
 
         let mut retry_after_sec = None;
@@ -268,13 +338,19 @@ impl RateLimitTracker {
                 let failure_count = if reason != RateLimitReason::ServerError {
                     // 只有非 ServerError 才累加失败计数（用于指数退避）
                     let now = SystemTime::now();
-                    // 这里我们使用 account_id 作为 key，不区分模型，
-                    // 因为这里是为了计算连续"账号级"问题的退避。
-                    // 如果需要针对模型的连续失败计数，可能需要改变 failure_counts 的 key。
-                    // 暂时保持 account_id，这样如果一个模型一直挂，也会增加计数，符合逻辑。
+                    let base_failure_key = if matches!(
+                        reason,
+                        RateLimitReason::QuotaExhausted | RateLimitReason::ModelCapacityExhausted
+                    ) && model.is_some()
+                    {
+                        self.get_limit_key(account_id, model.as_deref())
+                    } else {
+                        account_id.to_string()
+                    };
+                    let failure_key = format!("{}:{:?}", base_failure_key, reason);
                     let mut entry = self
                         .failure_counts
-                        .entry(account_id.to_string())
+                        .entry(failure_key.clone())
                         .or_insert((0, now));
 
                     let elapsed = now
@@ -283,8 +359,8 @@ impl RateLimitTracker {
                         .as_secs();
                     if elapsed > FAILURE_COUNT_EXPIRY_SECONDS {
                         tracing::debug!(
-                            "账号 {} 失败计数已过期（{}秒），重置为 0",
-                            account_id,
+                            "限流 Key {} 失败计数已过期（{}秒），重置为 0",
+                            failure_key,
                             elapsed
                         );
                         *entry = (0, now);
@@ -315,20 +391,12 @@ impl RateLimitTracker {
                         lockout
                     }
                     RateLimitReason::RateLimitExceeded => {
-                        // 速率限制 (TPM/RPM)
-                        let body_lower = body.to_lowercase();
-                        let lockout = if body_lower.contains("resource has been exhausted")
-                            || body_lower.contains("resource_exhausted")
-                        {
-                            30
-                        } else {
-                            5
-                        };
+                        // Rate limits are account-wide TPM/RPM limits. Keep the
+                        // short fixed backoff; quota/capacity use model keys.
                         tracing::debug!(
-                            "检测到速率限制 (RATE_LIMIT_EXCEEDED)，使用默认值 {}秒",
-                            lockout
+                            "检测到速率限制 (RATE_LIMIT_EXCEEDED)，使用默认值 5秒"
                         );
-                        lockout
+                        5
                     }
                     RateLimitReason::ModelCapacityExhausted => {
                         // 模型容量耗尽
@@ -358,16 +426,6 @@ impl RateLimitTracker {
             }
         };
 
-        let mut retry_sec = retry_sec;
-        if retry_sec > 300 {
-            tracing::info!(
-                "Capping retry lockout time for {} from {}s to 300s (5 minutes)",
-                account_id,
-                retry_sec
-            );
-            retry_sec = 300;
-        }
-
         let info = RateLimitInfo {
             reset_time: SystemTime::now() + Duration::from_secs(retry_sec),
             retry_after_sec: retry_sec,
@@ -376,15 +434,16 @@ impl RateLimitTracker {
             model: model.clone(),
         };
 
-        // [FIX] 使用复合 Key 存储 (如果是 Quota 且有 Model)
-        // 只有 QuotaExhausted 适合做模型隔离，其他如 RateLimitExceeded 通常是全账号的 TPM
-        let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
+        // Quota and model-capacity failures are model-specific. In particular,
+        // an Opus capacity lock must not block Sonnet on the same account.
+        let use_model_key = matches!(
+            reason,
+            RateLimitReason::QuotaExhausted | RateLimitReason::ModelCapacityExhausted
+        ) && model.is_some();
         let key = if use_model_key {
             self.get_limit_key(account_id, model.as_deref())
         } else {
             // 其他情况（如 RateLimitExceeded, ServerError）通常影响整个账号
-            // 或者我们也可以根据配置决定是否隔离。
-            // 简单起见，只有 QuotaExhausted 做细粒度隔离。
             account_id.to_string()
         };
 
@@ -429,6 +488,12 @@ impl RateLimitTracker {
                     .and_then(|v| v.as_str())
                 {
                     let msg_lower = msg.to_lowercase();
+                    if msg_lower.contains("model_capacity_exhausted")
+                        || msg_lower.contains("model capacity")
+                        || msg_lower.contains("no capacity available")
+                    {
+                        return RateLimitReason::ModelCapacityExhausted;
+                    }
                     if msg_lower.contains("per minute") || msg_lower.contains("rate limit") {
                         return RateLimitReason::RateLimitExceeded;
                     }
@@ -439,20 +504,28 @@ impl RateLimitTracker {
         // 如果无法从 JSON 解析，尝试从消息文本判断
         let body_lower = body.to_lowercase();
         // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
-        let generic_resource_exhausted = body_lower.contains("resource has been exhausted")
-            || body_lower.contains("resource_exhausted");
-        let explicit_quota_exhausted = body_lower.contains("quota_exhausted")
-            || body_lower.contains("quotaresetdelay")
-            || body_lower.contains("quota reset")
-            || body_lower.contains("quota limit")
-            || body_lower.contains("per day")
-            || body_lower.contains("daily quota");
-
-        if body_lower.contains("per minute")
+        if body_lower.contains("model_capacity_exhausted")
+            || body_lower.contains("model capacity")
+            || body_lower.contains("no capacity available")
+        {
+            RateLimitReason::ModelCapacityExhausted
+        } else if body_lower.contains("per minute")
             || body_lower.contains("rate limit")
             || body_lower.contains("too many requests")
-            || (generic_resource_exhausted && !explicit_quota_exhausted)
         {
+            RateLimitReason::RateLimitExceeded
+        } else if (body_lower.contains("resource has been exhausted")
+            || body_lower.contains("resource_exhausted"))
+            && !body_lower.contains("quota_exhausted")
+            && !body_lower.contains("quotaresetdelay")
+            && !body_lower.contains("quota reset")
+            && !body_lower.contains("quota limit")
+            && !body_lower.contains("per day")
+            && !body_lower.contains("daily quota")
+        {
+            // Google uses RESOURCE_EXHAUSTED for both short TPM/RPM pressure
+            // and true daily quota exhaustion. Without an explicit quota
+            // marker, keep the former on the short account-level backoff path.
             RateLimitReason::RateLimitExceeded
         } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
             RateLimitReason::QuotaExhausted
@@ -637,6 +710,18 @@ impl RateLimitTracker {
         }
     }
 
+    /// Return the shortest active wait for an account, optionally including a
+    /// model-scoped lock. This is used by the scheduler when deciding whether a
+    /// candidate can be retried immediately.
+    pub fn get_reset_seconds_for(&self, account_id: &str, model: Option<&str>) -> Option<u64> {
+        let wait = self.get_remaining_wait(account_id, model);
+        if wait > 0 {
+            Some(wait)
+        } else {
+            None
+        }
+    }
+
     /// 清除过期的限流记录
     #[allow(dead_code)]
     pub fn cleanup_expired(&self) -> usize {
@@ -661,7 +746,18 @@ impl RateLimitTracker {
 
     /// 清除指定账号的限流记录
     pub fn clear(&self, account_id: &str) -> bool {
-        self.limits.remove(account_id).is_some()
+        let prefix = format!("{}:", account_id);
+        let mut removed = self.limits.remove(account_id).is_some();
+        self.limits.retain(|key, _| {
+            let keep = !key.starts_with(&prefix);
+            if !keep {
+                removed = true;
+            }
+            keep
+        });
+        self.failure_counts.remove(account_id);
+        self.failure_counts.retain(|key, _| !key.starts_with(&prefix));
+        removed
     }
 
     /// 清除所有限流记录 (乐观重置策略)
@@ -762,6 +858,192 @@ mod tests {
         }"#;
         let reason = tracker.parse_rate_limit_reason(body);
         assert_eq!(reason, RateLimitReason::RateLimitExceeded);
+    }
+
+    #[test]
+    fn test_503_model_capacity_is_model_scoped() {
+        let tracker = RateLimitTracker::new();
+        let body = r#"{"error":{"details":[{"reason":"MODEL_CAPACITY_EXHAUSTED"}],"message":"No capacity available for model claude-opus-4-6-thinking"}}"#;
+
+        let info = tracker
+            .parse_from_error(
+                "acc_opus",
+                503,
+                None,
+                body,
+                Some("claude-opus-4-6-thinking".to_string()),
+                &[60, 300, 1800, 7200],
+            )
+            .expect("capacity response should create a lock");
+
+        assert_eq!(info.reason, RateLimitReason::ModelCapacityExhausted);
+        assert!(tracker.get_remaining_wait("acc_opus", Some("claude-opus-4-6-thinking")) > 0);
+        assert_eq!(
+            tracker.get_remaining_wait("acc_opus", Some("claude-sonnet-4-6")),
+            0,
+            "Opus capacity must not block Sonnet"
+        );
+        assert_eq!(tracker.get_remaining_wait("acc_opus", None), 0);
+    }
+
+    #[test]
+    fn test_capacity_failures_do_not_advance_quota_backoff() {
+        let tracker = RateLimitTracker::new();
+        let capacity = r#"{"error":{"details":[{"reason":"MODEL_CAPACITY_EXHAUSTED"}]}}"#;
+        let quota = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+
+        for _ in 0..3 {
+            tracker.parse_from_error(
+                "acc_mixed",
+                503,
+                None,
+                capacity,
+                Some("claude-opus-4-6-thinking".to_string()),
+                &[60, 300, 1800, 7200],
+            );
+        }
+
+        let info = tracker
+            .parse_from_error(
+                "acc_mixed",
+                429,
+                None,
+                quota,
+                Some("claude-opus-4-6-thinking".to_string()),
+                &[60, 300, 1800, 7200],
+            )
+            .expect("quota response should create a lock");
+        assert_eq!(info.retry_after_sec, 60);
+    }
+
+    #[test]
+    fn test_mark_success_for_model_clears_model_scoped_failures_and_locks() {
+        let tracker = RateLimitTracker::new();
+        let body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+        tracker.parse_from_error(
+            "acc_success",
+            429,
+            None,
+            body,
+            Some("gemini-3-flash".to_string()),
+            &[60, 300],
+        );
+        assert!(tracker.get_remaining_wait("acc_success", Some("gemini-3-flash")) > 0);
+        tracker.mark_success_for_model("acc_success", "gemini-3-flash");
+        assert_eq!(tracker.get_remaining_wait("acc_success", Some("gemini-3-flash")), 0);
+
+        let next = tracker
+            .parse_from_error(
+                "acc_success",
+                429,
+                None,
+                body,
+                Some("gemini-3-flash".to_string()),
+                &[60, 300],
+            )
+            .expect("second failure should be tracked");
+        assert_eq!(next.retry_after_sec, 60);
+    }
+
+    #[test]
+    fn test_success_clearing_does_not_cross_model_scopes() {
+        let tracker = RateLimitTracker::new();
+        let body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+        let backoff = [60, 300, 1800];
+
+        tracker.parse_from_error(
+            "acc_isolated",
+            429,
+            None,
+            body,
+            Some("gemini-3-flash".to_string()),
+            &backoff,
+        );
+        tracker.parse_from_error(
+            "acc_isolated",
+            429,
+            None,
+            body,
+            Some("claude-opus-4-6-thinking".to_string()),
+            &backoff,
+        );
+        tracker.parse_from_error(
+            "acc_isolated",
+            429,
+            None,
+            body,
+            None,
+            &backoff,
+        );
+        tracker.set_lockout_until(
+            "acc_isolated",
+            SystemTime::now() + Duration::from_secs(120),
+            RateLimitReason::RateLimitExceeded,
+            None,
+        );
+
+        // An account-only success clears only the account-wide lock. Both model
+        // locks and their failure ladders remain intact.
+        tracker.mark_success("acc_isolated");
+        assert_eq!(tracker.get_remaining_wait("acc_isolated", None), 0);
+        assert!(tracker.get_remaining_wait("acc_isolated", Some("gemini-3-flash")) > 0);
+        assert!(tracker
+            .get_remaining_wait("acc_isolated", Some("claude-opus-4-6-thinking"))
+            > 0);
+
+        // Clearing Flash must not release Opus. The next Flash failure starts
+        // at the first backoff step, while Opus advances to the second step.
+        tracker.mark_success_for_model("acc_isolated", "gemini-3-flash");
+        assert_eq!(tracker.get_remaining_wait("acc_isolated", Some("gemini-3-flash")), 0);
+        assert!(tracker
+            .get_remaining_wait("acc_isolated", Some("claude-opus-4-6-thinking"))
+            > 0);
+
+        let account_next = tracker
+            .parse_from_error("acc_isolated", 429, None, body, None, &backoff)
+            .unwrap();
+        assert_eq!(account_next.retry_after_sec, 60);
+
+        let flash_next = tracker
+            .parse_from_error(
+                "acc_isolated",
+                429,
+                None,
+                body,
+                Some("gemini-3-flash".to_string()),
+                &backoff,
+            )
+            .unwrap();
+        assert_eq!(flash_next.retry_after_sec, 60);
+
+        let opus_next = tracker
+            .parse_from_error(
+                "acc_isolated",
+                429,
+                None,
+                body,
+                Some("claude-opus-4-6-thinking".to_string()),
+                &backoff,
+            )
+            .unwrap();
+        assert_eq!(opus_next.retry_after_sec, 300);
+    }
+
+    #[test]
+    fn test_model_success_accepts_physical_alias_for_normalized_lock() {
+        let tracker = RateLimitTracker::new();
+        tracker.set_lockout_until(
+            "acc_alias",
+            SystemTime::now() + Duration::from_secs(120),
+            RateLimitReason::QuotaExhausted,
+            Some("gemini-3-flash".to_string()),
+        );
+
+        tracker.mark_success_for_model("acc_alias", "gemini-3.5-flash-low");
+        assert_eq!(
+            tracker.get_remaining_wait("acc_alias", Some("gemini-3-flash")),
+            0
+        );
     }
 
     #[test]

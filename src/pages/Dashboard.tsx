@@ -46,14 +46,25 @@ function Dashboard() {
             .map(a => findImageQuotaModel(a.quota?.models)?.percentage || 0)
             .filter(q => q > 0);
 
+        // Treat Sonnet and Opus as separate buckets. For the single summary
+        // metric, use the lowest available bucket so a depleted model is not
+        // hidden by the other model's healthy quota.
+        const getClaudeQuota = (a: Account): number | undefined => {
+            const values = [
+                findQuotaModel(a.quota?.models, 'claude-sonnet')?.percentage,
+                findQuotaModel(a.quota?.models, 'claude-opus')?.percentage,
+            ].filter((value): value is number => typeof value === 'number');
+            return values.length > 0 ? Math.min(...values) : undefined;
+        };
+
         const claudeQuotas = accounts
-            .map(a => findQuotaModel(a.quota?.models, 'claude')?.percentage || 0)
-            .filter(q => q > 0);
+            .map(a => getClaudeQuota(a))
+            .filter((q): q is number => q !== undefined);
 
         const lowQuotaCount = accounts.filter(a => {
             if (a.quota?.is_forbidden) return false;
             const gemini = getGeminiProQuota(a);
-            const claude = findQuotaModel(a.quota?.models, 'claude')?.percentage || 0;
+            const claude = getClaudeQuota(a) ?? 0;
             return gemini < 20 || claude < 20;
         }).length;
 

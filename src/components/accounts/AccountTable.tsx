@@ -52,8 +52,15 @@ import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
-import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
-import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
+import {
+    MODEL_CONFIG,
+    sortModels,
+    resolveQuotaModels,
+    ensurePinnedImageSelector,
+    getModelProtectionKey,
+    isQuotaModelProtected,
+    isSupportedClaudeQuotaModel,
+} from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 
@@ -128,27 +135,7 @@ interface AccountRowContentProps {
 
 
 function isModelProtected(protectedModels: string[] | undefined, modelName: string): boolean {
-    if (!protectedModels || protectedModels.length === 0) return false;
-    const lowerName = modelName.toLowerCase();
-
-    if (lowerName === 'gemini-pro') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-pro' && getModelProtectionKey(model) === 'gemini-3-pro-high',
-        );
-    }
-    if (lowerName === 'gemini-flash') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-flash' && getModelProtectionKey(model) === 'gemini-3-flash',
-        );
-    }
-    if (lowerName === 'claude-sonnet') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'claude' && getModelProtectionKey(model) === 'claude',
-        );
-    }
-
-    const protectionKey = getModelProtectionKey(lowerName);
-    return protectionKey ? protectedModels.includes(protectionKey) : false;
+    return isQuotaModelProtected(protectedModels, modelName);
 }
 
 // ============================================================================
@@ -336,10 +323,10 @@ function AccountRowContent({
                 };
             }).filter((item): item is { id: string; label: string; protectedKey: string; data: ModelQuota | undefined } => item !== null)
     ).filter(m => {
-            // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
-            const isHiddenThinking = m.id.includes('thinking');
-
-            if (isHiddenThinking) return false;
+            // Keep the two supported Claude buckets independent. Other stale
+            // thinking aliases remain hidden from the compact table.
+            if (m.id.startsWith('claude-') && !isSupportedClaudeQuotaModel(m.id)) return false;
+            if (!m.id.startsWith('claude-') && m.id.includes('thinking')) return false;
 
             // 基于标签去重 (例如 G3.1 Pro 只显示一次)
             // 优先显示有配额数据的 ID

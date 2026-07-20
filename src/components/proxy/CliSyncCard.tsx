@@ -70,7 +70,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
     const [syncAccounts, setSyncAccounts] = useState(false);
     const [droidSyncModal, setDroidSyncModal] = useState(false);
     const [selectedModels, setSelectedModels] = useState<Record<CliAppType, string>>({
-        Claude: 'claude-3-5-sonnet-latest',
+        Claude: 'claude-sonnet-4-6',
         Codex: 'gpt-4o',
         Gemini: 'gemini-1.5-pro',
         OpenCode: '',

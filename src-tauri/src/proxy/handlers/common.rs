@@ -6,8 +6,172 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, info};
+
+// ===== Image generation account controls =====
+
+/// Image generation has a much lower upstream concurrency tolerance than text.
+/// Keep both a global ceiling and a per-account ceiling so a burst cannot consume
+/// every account's quota at once. The environment overrides are intentionally read
+/// when the semaphore is first initialized, preserving a stable limit for the process.
+pub const IMAGE_PER_ACCOUNT_CONCURRENCY: usize = 2;
+const DEFAULT_IMAGE_GLOBAL_CONCURRENCY: usize = 48;
+const DEFAULT_IMAGE_GLOBAL_QUEUE_WAIT_MS: u64 = 300_000;
+static IMAGE_ACCOUNT_PERMITS: std::sync::OnceLock<
+    dashmap::DashMap<String, std::sync::Arc<tokio::sync::Semaphore>>,
+> = std::sync::OnceLock::new();
+static IMAGE_GLOBAL_PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+/// Image models are not uniformly exposed across accounts. Give callers one
+/// attempt per account so a missing model on one account does not stop the pool.
+pub fn image_max_attempts(pool_size: usize) -> usize {
+    pool_size.max(1)
+}
+
+const DEFAULT_TEXT_MAX_ATTEMPTS: usize = 20;
+
+/// Bound text-request failover fan-out while allowing more than the historical
+/// three accounts. Successful requests still use the full-pool scheduler; this
+/// limit only protects a single long request from being replayed against every
+/// account after a malformed upstream stream. Operators with a smaller/larger
+/// pool can override it explicitly.
+pub fn account_rotation_attempts(pool_size: usize) -> usize {
+    let configured = std::env::var("ABV_TEXT_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TEXT_MAX_ATTEMPTS);
+    pool_size
+        .saturating_add(1)
+        .min(configured)
+        .max(2)
+}
+
+/// Validate a complete Gemini JSON response before any protocol adapter turns
+/// it into a downstream 200. Prompt safety blocks are legitimate terminal
+/// responses; otherwise every returned candidate must carry a finish reason.
+pub fn validate_gemini_terminal_response(value: &Value) -> Result<(), String> {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Err(format!("Gemini upstream error: {error}"));
+    }
+
+    let response = value.get("response").unwrap_or(value);
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        return Err(format!("Gemini upstream error: {error}"));
+    }
+    if response
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+    {
+        return Ok(());
+    }
+
+    let candidates = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Gemini response is missing candidates".to_string())?;
+    if candidates.is_empty() {
+        return Err("Gemini response has no candidates".to_string());
+    }
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let finish_reason = candidate
+            .get("finishReason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty());
+        if finish_reason.is_none() {
+            return Err(format!(
+                "Gemini candidate {index} is missing finishReason"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return whether an image failure is account/model specific and should rotate.
+/// Upstream 5xx is deliberately excluded: fanning a capacity outage across every
+/// account only increases load and makes recovery slower.
+pub fn is_retryable_image_error(status_code: u16, error_text: &str) -> bool {
+    match status_code {
+        401 | 403 | 404 | 429 => true,
+        400 => {
+            let lower = error_text.to_ascii_lowercase();
+            lower.contains("not supported")
+                || lower.contains("unsupported")
+                || lower.contains("does not support")
+                || lower.contains("not available")
+                || lower.contains("model not found")
+                || lower.contains("model is not found")
+        }
+        _ => false,
+    }
+}
+
+fn image_global_concurrency_limit() -> usize {
+    std::env::var("ABV_IMAGE_GLOBAL_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_IMAGE_GLOBAL_CONCURRENCY)
+}
+
+fn image_global_queue_wait_ms() -> u64 {
+    std::env::var("ABV_IMAGE_GLOBAL_QUEUE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_IMAGE_GLOBAL_QUEUE_WAIT_MS)
+}
+
+pub async fn acquire_global_image_permit() -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    let semaphore = IMAGE_GLOBAL_PERMITS
+        .get_or_init(|| {
+            let limit = image_global_concurrency_limit();
+            info!(
+                "[Images] Global image concurrency limit: {}, queue_wait={}ms",
+                limit,
+                image_global_queue_wait_ms()
+            );
+            std::sync::Arc::new(tokio::sync::Semaphore::new(limit))
+        })
+        .clone();
+    let wait_ms = image_global_queue_wait_ms();
+
+    match timeout(Duration::from_millis(wait_ms), semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err("Image concurrency limiter closed".to_string()),
+        Err(_) => Err(format!(
+            "Image concurrency queue timeout (limit={}, waited={}ms)",
+            image_global_concurrency_limit(),
+            wait_ms
+        )),
+    }
+}
+
+pub async fn acquire_image_account_permit(
+    account_id: &str,
+) -> tokio::sync::OwnedSemaphorePermit {
+    let semaphore = {
+        let entry = IMAGE_ACCOUNT_PERMITS
+            .get_or_init(dashmap::DashMap::new)
+            .entry(account_id.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    IMAGE_PER_ACCOUNT_CONCURRENCY,
+                ))
+            });
+        entry.value().clone()
+    };
+
+    semaphore
+        .acquire_owned()
+        .await
+        .expect("image account semaphore closed unexpectedly")
+}
 
 // ===== 统一重试与退避策略 =====
 
@@ -226,4 +390,63 @@ pub async fn handle_detect_model(
     }
 
     Json(response).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_retry_policy_rotates_account_specific_errors_only() {
+        assert!(is_retryable_image_error(401, ""));
+        assert!(is_retryable_image_error(403, ""));
+        assert!(is_retryable_image_error(404, ""));
+        assert!(is_retryable_image_error(429, ""));
+        assert!(is_retryable_image_error(400, "model is not supported by this account"));
+        assert!(!is_retryable_image_error(400, "malformed request"));
+        assert!(!is_retryable_image_error(500, "capacity"));
+        assert!(!is_retryable_image_error(503, "service unavailable"));
+    }
+
+    #[test]
+    fn image_attempts_cover_the_entire_pool() {
+        assert_eq!(image_max_attempts(0), 1);
+        assert_eq!(image_max_attempts(3), 3);
+        assert_eq!(image_max_attempts(69), 69);
+    }
+
+    #[test]
+    fn text_attempts_cover_the_entire_pool_plus_one_grace_retry() {
+        assert_eq!(account_rotation_attempts(0), 2);
+        assert_eq!(account_rotation_attempts(3), 4);
+        assert_eq!(account_rotation_attempts(69), 20);
+    }
+
+    #[test]
+    fn complete_gemini_json_requires_every_candidate_to_finish() {
+        assert!(validate_gemini_terminal_response(&json!({
+            "candidates": [
+                {"finishReason": "STOP"},
+                {"finishReason": "MAX_TOKENS"}
+            ]
+        }))
+        .is_ok());
+
+        let error = validate_gemini_terminal_response(&json!({
+            "candidates": [
+                {"finishReason": "STOP"},
+                {"content": {"parts": [{"text": "partial"}]}}
+            ]
+        }))
+        .expect_err("an unfinished secondary candidate must fail validation");
+        assert!(error.contains("candidate 1"));
+    }
+
+    #[test]
+    fn prompt_block_is_a_valid_terminal_response() {
+        assert!(validate_gemini_terminal_response(&json!({
+            "promptFeedback": {"blockReason": "SAFETY"}
+        }))
+        .is_ok());
+    }
 }

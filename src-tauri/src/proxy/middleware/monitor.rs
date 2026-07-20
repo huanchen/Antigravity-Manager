@@ -319,26 +319,161 @@ fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
 }
 
 fn extract_output_tokens(usage: &Value) -> Option<u32> {
+    let reasoning = extract_reasoning_tokens(usage).unwrap_or(0);
+    let tool_use = value_as_u32(usage.get("total_tool_use_tokens")).unwrap_or(0);
+
+    // Downstream OpenAI fields are already inclusive of reasoning.
     if let Some(tokens) = value_as_u32(
         usage
             .get("completion_tokens")
             .or_else(|| usage.get("output_tokens")),
     ) {
-        return Some(tokens);
+        // A few adapters emit output_tokens=0 in an intermediate frame while
+        // still carrying non-zero reasoning tokens. Let the raw counters below
+        // recover that usage instead of persisting a misleading zero.
+        if tokens > 0 || (reasoning == 0 && tool_use == 0) {
+            return Some(tokens);
+        }
     }
 
-    let base = value_as_u32(
+    // Raw Gemini variants disagree on whether candidatesTokenCount includes
+    // hidden thoughts. When prompt and total are both present, their difference
+    // is the only representation-independent output count.
+    let total = value_as_u32(
+        usage
+            .get("total_tokens")
+            .or_else(|| usage.get("totalTokenCount")),
+    );
+    let candidate = value_as_u32(
         usage
             .get("total_output_tokens")
             .or_else(|| usage.get("candidatesTokenCount")),
-    )?;
-    let has_new_format = usage.get("total_output_tokens").is_some();
-    if has_new_format {
-        let reasoning = extract_reasoning_tokens(usage).unwrap_or(0);
-        let tool_use = value_as_u32(usage.get("total_tool_use_tokens")).unwrap_or(0);
-        Some(base + reasoning + tool_use)
-    } else {
-        Some(base)
+    );
+    if let Some(output) = extract_input_tokens(usage)
+        .zip(total)
+        .and_then(|(input, total)| total.checked_sub(input))
+    {
+        // Use total-input when it is compatible with the component counters.
+        // Do not trust a zero placeholder over a non-zero candidate/thought
+        // count, nor a malformed total smaller than those counters.
+        if candidate.map(|value| value <= output).unwrap_or(true)
+            && reasoning <= output
+            && tool_use <= output
+        {
+            return Some(output);
+        }
+    }
+
+    let base = candidate;
+    if base.is_none() && reasoning == 0 && tool_use == 0 {
+        return None;
+    }
+    Some(
+        base.unwrap_or(0)
+            .saturating_add(reasoning)
+            .saturating_add(tool_use),
+    )
+}
+
+fn merge_token_count(current: &mut Option<u32>, incoming: Option<u32>) {
+    if let Some(incoming) = incoming {
+        *current = Some(current.unwrap_or(0).max(incoming));
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{extract_output_tokens, merge_token_count};
+    use serde_json::json;
+
+    #[test]
+    fn compat_regression_legacy_output_includes_thought_tokens() {
+        let usage = json!({
+            "candidatesTokenCount": 10,
+            "thoughtsTokenCount": 286
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(296));
+    }
+
+    #[test]
+    fn compat_regression_transformed_output_is_not_double_counted() {
+        let usage = json!({
+            "output_tokens": 296,
+            "output_tokens_details": { "reasoning_tokens": 286 }
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(296));
+    }
+
+    #[test]
+    fn compat_regression_thought_only_usage_is_not_reported_as_zero() {
+        let usage = json!({ "thoughtsTokenCount": 286 });
+
+        assert_eq!(extract_output_tokens(&usage), Some(286));
+    }
+
+    #[test]
+    fn inclusive_candidates_are_not_double_counted() {
+        let usage = json!({
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 50,
+            "thoughtsTokenCount": 20,
+            "totalTokenCount": 150
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(50));
+    }
+
+    #[test]
+    fn missing_candidates_are_derived_from_total() {
+        let usage = json!({
+            "promptTokenCount": 105,
+            "thoughtsTokenCount": 125,
+            "totalTokenCount": 230
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(125));
+    }
+
+    #[test]
+    fn normal_candidates_match_total_minus_prompt() {
+        let usage = json!({
+            "promptTokenCount": 105,
+            "candidatesTokenCount": 124,
+            "totalTokenCount": 229
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(124));
+    }
+
+    #[test]
+    fn zero_total_placeholder_does_not_hide_candidates() {
+        let usage = json!({
+            "promptTokenCount": 0,
+            "candidatesTokenCount": 10,
+            "totalTokenCount": 0
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(10));
+    }
+
+    #[test]
+    fn zero_openai_output_falls_back_to_reasoning_tokens() {
+        let usage = json!({
+            "output_tokens": 0,
+            "output_tokens_details": { "reasoning_tokens": 286 }
+        });
+
+        assert_eq!(extract_output_tokens(&usage), Some(286));
+    }
+
+    #[test]
+    fn later_zero_snapshot_does_not_erase_monitor_count() {
+        let mut count = None;
+        merge_token_count(&mut count, Some(123));
+        merge_token_count(&mut count, Some(0));
+        assert_eq!(count, Some(123));
     }
 }
 
@@ -550,10 +685,9 @@ pub async fn monitor_middleware(
                 let mut reasoning_tokens: Option<u32> = None;
 
                 for line in full_response.lines() {
-                    if !line.starts_with("data: ") {
+                    let Some(json_str) = line.strip_prefix("data:").map(str::trim) else {
                         continue;
-                    }
-                    let json_str = line.trim_start_matches("data: ").trim();
+                    };
                     if json_str == "[DONE]" {
                         continue;
                     }
@@ -696,7 +830,10 @@ pub async fn monitor_middleware(
                                         if let Some(output_tokens) =
                                             usage.get("output_tokens").and_then(|v| v.as_u64())
                                         {
-                                            log.output_tokens = Some(output_tokens as u32);
+                                            merge_token_count(
+                                                &mut log.output_tokens,
+                                                Some(output_tokens as u32),
+                                            );
                                         }
                                     }
                                 }
@@ -770,8 +907,8 @@ pub async fn monitor_middleware(
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
+                            merge_token_count(&mut log.input_tokens, extract_input_tokens(usage));
+                            merge_token_count(&mut log.output_tokens, extract_output_tokens(usage));
                             cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
                             log.cached_tokens = log.cached_tokens.or(cached_tokens);
                             reasoning_tokens =
@@ -896,10 +1033,13 @@ pub async fn monitor_middleware(
             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                 if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
                     for line in full_tail.lines().rev() {
-                        if line.starts_with("data: ")
+                        if line.strip_prefix("data:").is_some()
                             && (line.contains("\"usage\"") || line.contains("\"usageMetadata\""))
                         {
-                            let json_str = line.trim_start_matches("data: ").trim();
+                            let json_str = line
+                                .strip_prefix("data:")
+                                .map(str::trim)
+                                .unwrap_or_default();
                             if let Ok(json) = serde_json::from_str::<Value>(json_str) {
                                 if let Some(usage) = json
                                     .get("usage")
@@ -907,8 +1047,14 @@ pub async fn monitor_middleware(
                                     .or(json.get("response").and_then(|r| r.get("usage")))
                                     .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                                 {
-                                    log.input_tokens = extract_input_tokens(usage);
-                                    log.output_tokens = extract_output_tokens(usage);
+                                    merge_token_count(
+                                        &mut log.input_tokens,
+                                        extract_input_tokens(usage),
+                                    );
+                                    merge_token_count(
+                                        &mut log.output_tokens,
+                                        extract_output_tokens(usage),
+                                    );
                                     log.cached_tokens =
                                         log.cached_tokens.or_else(|| extract_cached_tokens(usage));
                                     break;
@@ -946,8 +1092,8 @@ pub async fn monitor_middleware(
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
+                            merge_token_count(&mut log.input_tokens, extract_input_tokens(usage));
+                            merge_token_count(&mut log.output_tokens, extract_output_tokens(usage));
                             log.cached_tokens =
                                 log.cached_tokens.or_else(|| extract_cached_tokens(usage));
 

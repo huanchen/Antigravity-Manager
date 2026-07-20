@@ -1,7 +1,7 @@
 import { Pin, Check } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { PinnedQuotaModelsConfig } from '../../types/config';
-import { MODEL_CONFIG } from '../../config/modelConfig';
+import { MODEL_CONFIG, isSupportedClaudeQuotaModel } from '../../config/modelConfig';
 import { useAccountStore } from '../../stores/useAccountStore';
 
 interface PinnedQuotaModelsProps {
@@ -43,7 +43,9 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
     // 基础内置配置模型
     const baseModels = Object.entries(MODEL_CONFIG)
         .filter(([id, cfg]) => {
-            // 隐藏思考变体
+            // Keep the two supported Claude quota buckets selectable; hide
+            // stale thinking aliases and unrelated internal variants.
+            if (id.startsWith('claude-')) return isSupportedClaudeQuotaModel(id);
             if (id.includes('thinking')) return false;
 
             const labelKey = (cfg.shortLabel || cfg.label).toLowerCase();
@@ -62,6 +64,7 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
     const dynamicModels = accounts.flatMap(a => a.quota?.models || [])
         .filter(m => {
             const id = m.name.toLowerCase();
+            if (id.startsWith('claude-') && !isSupportedClaudeQuotaModel(id)) return false;
             if (id.includes('thinking')) return false;
             // 查重：避免内置里已经包含的模型或同名 id 重复
             if (uniqueIds.has(id)) return false;

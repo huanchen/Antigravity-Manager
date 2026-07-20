@@ -392,37 +392,58 @@ pub async fn save_config(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     config: AppConfig,
 ) -> Result<(), String> {
+    // Capture the previous values before saving.  In particular, quota
+    // protection reloads are driven by a comparison with the old config.
+    let previous_config = modules::load_app_config().ok();
     modules::save_app_config(&config)?;
 
     // 通知托盘配置已更新
     let _ = app.emit("config://updated", ());
 
-    // 热更新正在运行的服务
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
+    // The admin server is kept alive when the forwarding service is stopped.
+    // Select whichever runtime instance owns the active TokenManager, then
+    // release the state lock before awaiting any network/client updates.
+    let runtime = {
+        let instance_lock = proxy_state.instance.read().await;
+        if let Some(instance) = instance_lock.as_ref() {
+            Some((
+                instance.axum_server.clone(),
+                instance.token_manager.clone(),
+            ))
+        } else {
+            drop(instance_lock);
+            let admin_lock = proxy_state.admin_server.read().await;
+            admin_lock.as_ref().map(|admin| {
+                (
+                    admin.axum_server.clone(),
+                    admin.axum_server.token_manager.clone(),
+                )
+            })
+        }
+    };
+
+    let monitor_lock = proxy_state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        monitor.set_enabled(config.proxy.enable_logging);
+    }
+
+    if let Some((axum_server, token_manager)) = runtime {
         // 更新模型映射
-        instance.axum_server.update_mapping(&config.proxy).await;
+        axum_server.update_mapping(&config.proxy).await;
         // 更新上游代理
-        instance
-            .axum_server
+        axum_server
             .update_proxy(config.proxy.upstream_proxy.clone())
             .await;
         // 更新安全策略 (auth)
-        instance.axum_server.update_security(&config.proxy).await;
+        axum_server.update_security(&config.proxy).await;
         // 更新 z.ai 配置
-        instance.axum_server.update_zai(&config.proxy).await;
+        axum_server.update_zai(&config.proxy).await;
         // 更新实验性配置
-        instance
-            .axum_server
-            .update_experimental(&config.proxy)
-            .await;
+        axum_server.update_experimental(&config.proxy).await;
         // 更新调试日志配置
-        instance
-            .axum_server
-            .update_debug_logging(&config.proxy)
-            .await;
+        axum_server.update_debug_logging(&config.proxy).await;
         // [NEW] 更新 User-Agent 配置
-        instance.axum_server.update_user_agent(&config.proxy).await;
+        axum_server.update_user_agent(&config.proxy).await;
         // 更新 Thinking Budget 配置
         crate::proxy::update_thinking_budget_config(config.proxy.thinking_budget.clone());
         // [NEW] 更新全局系统提示词配置
@@ -440,15 +461,16 @@ pub async fn save_config(
             config.proxy.experimental.context_compression_threshold_l3,
         );
         // 更新代理池配置
-        instance
-            .axum_server
+        axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
-        // 更新熔断配置
-        instance
-            .token_manager
-            .update_circuit_breaker_config(config.circuit_breaker.clone())
-            .await;
+        // 更新调度、固定账号、熔断及配额保护状态
+        crate::proxy::server::apply_token_manager_runtime_config(
+            token_manager.as_ref(),
+            previous_config.as_ref(),
+            &config,
+        )
+        .await?;
         tracing::debug!("已同步热更新反代服务配置");
     }
 

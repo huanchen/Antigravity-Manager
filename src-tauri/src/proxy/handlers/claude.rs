@@ -26,7 +26,154 @@ use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
-use std::sync::{atomic::Ordering, Arc}; // [NEW]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+}; // [NEW]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn estimate_claude_tokens(request: &ClaudeRequest) -> u32 {
+    serde_json::to_string(request)
+        .map(|value| {
+            let ascii = value.chars().filter(|ch| ch.is_ascii()).count() as u32;
+            let non_ascii = value.chars().filter(|ch| !ch.is_ascii()).count() as u32;
+            non_ascii.saturating_add((ascii.saturating_add(3)) / 4).max(1)
+        })
+        .unwrap_or(1)
+}
+
+fn ensure_claude_usage(
+    response: &mut crate::proxy::mappers::claude::models::ClaudeResponse,
+    request: &ClaudeRequest,
+) {
+    if response.usage.input_tokens == 0 {
+        response.usage.input_tokens = estimate_claude_tokens(request);
+    }
+    if response.usage.output_tokens == 0 && !response.content.is_empty() {
+        let output = serde_json::to_string(&response.content)
+            .map(|value| {
+                let ascii = value.chars().filter(|ch| ch.is_ascii()).count() as u32;
+                let non_ascii = value.chars().filter(|ch| !ch.is_ascii()).count() as u32;
+                non_ascii.saturating_add((ascii.saturating_add(3)) / 4).max(1)
+            })
+            .unwrap_or(1);
+        response.usage.output_tokens = output;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudePeekDisposition {
+    Ignore,
+    Meaningful,
+    Error,
+}
+
+fn classify_claude_stream_chunk(bytes: &[u8]) -> ClaudePeekDisposition {
+    let text = String::from_utf8_lossy(bytes);
+    let mut event_error = false;
+    let mut meaningful = false;
+    for line in text.lines() {
+        if line.trim().eq_ignore_ascii_case("event: error") {
+            event_error = true;
+        }
+        let Some(data) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if matches!(payload.get("type").and_then(Value::as_str), Some("error" | "response.failed"))
+            || payload.get("error").is_some_and(|value| !value.is_null())
+        {
+            return ClaudePeekDisposition::Error;
+        }
+
+        match payload.get("type").and_then(Value::as_str) {
+            Some("message_start" | "message_stop") => {}
+            Some("content_block_start") => {
+                let block = payload.get("content_block");
+                meaningful |= block
+                    .and_then(|block| block.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind == "tool_use" || kind == "server_tool_use")
+                    || block
+                        .and_then(|block| block.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty());
+            }
+            Some("content_block_delta") => {
+                let delta = payload.get("delta");
+                meaningful |= ["text", "thinking", "partial_json"]
+                    .iter()
+                    .any(|field| {
+                        delta
+                            .and_then(|delta| delta.get(*field))
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                    });
+            }
+            Some("message_delta") => {
+                meaningful |= payload
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .is_some_and(|reason| !reason.is_null());
+            }
+            _ => {}
+        }
+    }
+    if event_error {
+        ClaudePeekDisposition::Error
+    } else if meaningful {
+        ClaudePeekDisposition::Meaningful
+    } else {
+        ClaudePeekDisposition::Ignore
+    }
+}
+
+fn claude_stream_chunk_has_error_event(bytes: &[u8]) -> bool {
+    classify_claude_stream_chunk(bytes) == ClaudePeekDisposition::Error
+}
+
+#[cfg(test)]
+mod claude_stream_peek_tests {
+    use super::{
+        classify_claude_stream_chunk, claude_stream_chunk_has_error_event,
+        ClaudePeekDisposition,
+    };
+
+    #[test]
+    fn message_start_is_buffered_until_model_output() {
+        let chunk = br#"event: message_start
+data: {"type":"message_start","message":{"stop_reason":null}}
+
+"#;
+        assert_eq!(
+            classify_claude_stream_chunk(chunk),
+            ClaudePeekDisposition::Ignore
+        );
+    }
+
+    #[test]
+    fn text_delta_is_meaningful() {
+        let chunk = br#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}
+
+"#;
+        assert_eq!(
+            classify_claude_stream_chunk(chunk),
+            ClaudePeekDisposition::Meaningful
+        );
+    }
+
+    #[test]
+    fn event_error_rotates_before_commit() {
+        let chunk = br#"event: error
+data: {"type":"error","error":{"type":"overloaded_error"}}
+
+"#;
+        assert!(claude_stream_chunk_has_error_event(chunk));
+    }
+}
 
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
@@ -160,7 +307,70 @@ fn apply_thinking_hints(
     }
 }
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+const OPUS_FAST_RETRY_MAX_ATTEMPTS: usize = 4;
+const OPUS_429_FAST_RETRY_MAX_ATTEMPTS: usize = 3;
+const OPUS_FAST_RETRY_DELAY_MS: u64 = 200;
+const OPUS_FALLBACK_MODEL: &str = "claude-sonnet-4-6";
+const OPUS_FALLBACK_CAPACITY_COOLDOWN_SECS: u64 = 60;
+const OPUS_FALLBACK_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
+
+static OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn is_opus_46_thinking_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("claude-opus-4-6") && lower.contains("thinking")
+}
+
+fn is_opus_fast_fail_status(status_code: u16) -> bool {
+    matches!(status_code, 429 | 503 | 529)
+}
+
+fn opus_fast_retry_limit(status_code: u16, max_attempts: usize) -> usize {
+    let cap = if status_code == 429 {
+        OPUS_429_FAST_RETRY_MAX_ATTEMPTS
+    } else {
+        OPUS_FAST_RETRY_MAX_ATTEMPTS
+    };
+    max_attempts.min(cap).max(1)
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn opus_fallback_remaining_secs() -> u64 {
+    OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH
+        .load(Ordering::Relaxed)
+        .saturating_sub(unix_now_secs())
+}
+
+fn activate_opus_fallback(status_code: u16) -> u64 {
+    let cooldown = if status_code == 429 {
+        OPUS_FALLBACK_RATE_LIMIT_COOLDOWN_SECS
+    } else {
+        OPUS_FALLBACK_CAPACITY_COOLDOWN_SECS
+    };
+    let now = unix_now_secs();
+    let until = now.saturating_add(cooldown);
+    let mut current = OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH.load(Ordering::Relaxed);
+    while until > current {
+        match OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH.compare_exchange(
+            current,
+            until,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+    OPUS_TO_SONNET_FALLBACK_UNTIL_EPOCH
+        .load(Ordering::Relaxed)
+        .saturating_sub(now)
+}
 
 // ===== Model Constants for Background Tasks =====
 // These can be adjusted for performance/cost optimization or overridden by custom_mapping
@@ -238,7 +448,8 @@ The structure MUST be as follows:
 // ===== 统一退避策略模块 =====
 // 移除本地重复定义，使用 common 中的统一实现
 use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+    account_rotation_attempts, apply_retry_strategy, determine_retry_strategy,
+    should_rotate_account, RetryStrategy,
 };
 
 // ===== 退避策略模块结束 =====
@@ -246,6 +457,7 @@ use super::common::{
 #[cfg(test)]
 mod variant_tests {
     use super::*;
+    use crate::proxy::mappers::claude::models::ThinkingConfig;
 
     fn request_with_effort(model: &str, effort: &str, budget_tokens: u32) -> ClaudeRequest {
         serde_json::from_value(json!({
@@ -351,6 +563,107 @@ mod variant_tests {
             Some("high")
         );
     }
+
+    #[test]
+    fn anthropic_variant_preserves_explicit_small_max_tokens() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "gemini-3.5-flash",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 128
+        }))
+        .expect("test request must deserialize");
+
+        assert!(apply_variant(&mut request, None, None).is_none());
+
+        assert_eq!(request.max_tokens, Some(128));
+        assert_eq!(request.model, "gemini-3.5-flash");
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn anthropic_pro_alias_keeps_positive_thinking_budget() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 128,
+            "thinking": {"type": "disabled", "budget_tokens": 0}
+        }))
+        .expect("test request must deserialize");
+
+        apply_variant(&mut request, None, Some(0)).expect("pro alias must resolve");
+
+        assert_eq!(request.max_tokens, Some(128));
+        assert_eq!(
+            request.thinking.as_ref().map(|thinking| thinking.type_.as_str()),
+            Some("enabled")
+        );
+        assert!(request
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget_tokens)
+            .unwrap_or(0)
+            > 0);
+    }
+
+    #[test]
+    fn anthropic_generic_pro_alias_defaults_to_low_checkpoint() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "gemini-3.1-pro",
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .expect("test request must deserialize");
+
+        let spec = apply_variant(&mut request, None, None).expect("pro alias must resolve");
+        assert_eq!(spec.id, "gemini-3.1-pro-low");
+        assert_eq!(request.model, "gemini-3.1-pro-low");
+        assert_eq!(request.thinking.as_ref().and_then(|t| t.budget_tokens), Some(1001));
+    }
+
+    #[test]
+    fn claude_opus_preserves_client_budget_when_present() {
+        let client_budget = Some(32_768);
+        let spec = crate::proxy::common::variant_mapping::resolve(
+            "claude-opus-4-6-thinking",
+            client_budget,
+        )
+        .expect("Claude Opus 4.6 thinking must resolve");
+        let request_thinking = ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+            effort: None,
+        };
+
+        assert_eq!(request_thinking.budget_tokens, client_budget);
+    }
+
+    #[test]
+    fn claude_opus_falls_back_to_spec_budget_when_client_budget_is_absent() {
+        let spec = crate::proxy::common::variant_mapping::resolve(
+            "claude-opus-4-6-thinking",
+            None,
+        )
+        .expect("Claude Opus 4.6 thinking must resolve");
+        let request_thinking = ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(spec.effective_thinking_budget(None)),
+            effort: None,
+        };
+
+        assert_eq!(request_thinking.budget_tokens, Some(1_024));
+    }
+
+    #[test]
+    fn opus_fast_retry_policy_is_limited_and_status_specific() {
+        assert!(is_opus_46_thinking_model("claude-opus-4-6-thinking"));
+        assert!(!is_opus_46_thinking_model("claude-sonnet-4-6"));
+        assert!(is_opus_fast_fail_status(429));
+        assert!(is_opus_fast_fail_status(503));
+        assert!(is_opus_fast_fail_status(529));
+        assert!(!is_opus_fast_fail_status(500));
+        assert_eq!(opus_fast_retry_limit(429, 20), 3);
+        assert_eq!(opus_fast_retry_limit(503, 20), 4);
+        assert_eq!(opus_fast_retry_limit(503, 2), 2);
+    }
 }
 
 fn apply_variant(
@@ -358,17 +671,80 @@ fn apply_variant(
     effort_tier: Option<crate::proxy::common::variant_mapping::VariantTier>,
     client_budget: Option<u32>,
 ) -> Option<crate::proxy::common::variant_mapping::RealModelSpec> {
+    let original_model = request.model.clone();
+    let original_max_tokens = request.max_tokens;
+    let explicit_disabled = request
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.type_ == "disabled");
+    let explicit_thinking = request.thinking.as_ref().is_some_and(|thinking| {
+        matches!(thinking.type_.as_str(), "enabled" | "adaptive")
+            || thinking.budget_tokens.is_some()
+            || thinking.effort.is_some()
+    });
+    let original_selects_variant = ["-thinking", "-low", "-medium", "-high", "-agent"]
+        .iter()
+        .any(|suffix| original_model.to_ascii_lowercase().ends_with(suffix));
+    let requires_variant_without_hint = {
+        let lower = original_model.to_ascii_lowercase();
+        lower.contains("gemini-3.1-pro")
+            || lower.contains("gemini-3-pro")
+            || lower.contains("gemini-pro-agent")
+    };
+    // Keep a generic Pro alias on the verified low checkpoint unless the
+    // caller explicitly selects a tier/effort.  This mirrors the OpenAI
+    // adapter and avoids routing plain Anthropic requests to the internal
+    // agent checkpoint.
+    let conservative_pro_tier = if requires_variant_without_hint
+        && !explicit_thinking
+        && effort_tier.is_none()
+        && !original_selects_variant
+        && client_budget.is_none()
+    {
+        Some(crate::proxy::common::variant_mapping::VariantTier::Low)
+    } else {
+        effort_tier
+    };
     let spec = crate::proxy::common::variant_mapping::resolve_with_tier(
-        &request.model,
-        effort_tier,
+        &original_model,
+        conservative_pro_tier,
         client_budget,
     )?;
 
+    // Do not turn a plain canonical Flash request into the default high-tier
+    // agent checkpoint. Explicit tier/effort/thinking (or Pro's required
+    // positive budget) is needed before applying the variant rewrite.
+    if !explicit_thinking
+        && effort_tier.is_none()
+        && client_budget.is_none()
+        && !original_selects_variant
+        && !requires_variant_without_hint
+        && crate::proxy::common::variant_mapping::resolve_non_variant_model(&original_model)
+            .is_none()
+    {
+        return None;
+    }
+
     request.model = spec.id.to_string();
+    let lower_real_model = spec.id.to_ascii_lowercase();
+    let requires_positive_thinking = lower_real_model.contains("gemini-pro-agent")
+        || lower_real_model.contains("gemini-3.1-pro")
+        || lower_real_model.contains("gemini-3-pro")
+        || lower_real_model.contains("claude-opus") && lower_real_model.contains("thinking");
+    let enable_thinking = requires_positive_thinking
+        || (!explicit_disabled
+            && (explicit_thinking || effort_tier.is_some() || original_selects_variant));
+
+    if spec.thinking_budget == 0 || !enable_thinking {
+        request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+            type_: "disabled".to_string(),
+            budget_tokens: Some(0),
+            effort: None,
+        });
+    }
     if spec.thinking_budget == 0 {
-        request.thinking = None;
         request.tools = None;
-    } else {
+    } else if enable_thinking {
         request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
             type_: "enabled".to_string(),
             budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
@@ -376,7 +752,7 @@ fn apply_variant(
         });
     }
     request.output_config = None;
-    request.max_tokens = Some(spec.max_output_tokens);
+    request.max_tokens = original_max_tokens.or(Some(spec.max_output_tokens));
 
     Some(spec)
 }
@@ -406,6 +782,7 @@ pub async fn handle_messages(
             .collect::<String>()
             .to_lowercase();
     let debug_cfg = state.debug_logging.read().await.clone();
+    let direct_non_stream = state.experimental.read().await.direct_non_stream;
 
     // [NEW] Detect Client Adapter
     // 检查是否有匹配的客户端适配器（如 opencode）
@@ -789,12 +1166,22 @@ pub async fn handle_messages(
     let token_manager = state.token_manager;
 
     let pool_size = token_manager.len();
+    let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &request_for_body.model,
+        &*state.custom_mapping.read().await,
+    );
+    let initial_opus_46 = is_opus_46_thinking_model(&initial_mapped_model);
     // [FIX] Ensure max_attempts is at least 2 to allow for internal retries (e.g. stripping signatures)
     // even if the user has only 1 account.
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let base_max_attempts = account_rotation_attempts(pool_size);
+    let max_attempts = if initial_opus_46 {
+        base_max_attempts.saturating_add(1)
+    } else {
+        base_max_attempts
+    };
 
     let mut last_error = String::new();
-    let retried_without_thinking = false;
+    let mut retried_without_thinking = false;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
@@ -802,10 +1189,26 @@ pub async fn handle_messages(
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
-        let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let resolved_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
         );
+        let fallback_remaining = if is_opus_46_thinking_model(&resolved_mapped_model) {
+            opus_fallback_remaining_secs()
+        } else {
+            0
+        };
+        let mut mapped_model = if fallback_remaining > 0 {
+            tracing::warn!(
+                "[{}] Opus 4.6 thinking cooldown active ({}s), routing this attempt to {}",
+                trace_id,
+                fallback_remaining,
+                OPUS_FALLBACK_MODEL
+            );
+            OPUS_FALLBACK_MODEL.to_string()
+        } else {
+            resolved_mapped_model
+        };
         last_mapped_model = Some(mapped_model.clone());
 
         // 将 Claude 工具转为 Value 数组以便探测联网
@@ -847,6 +1250,22 @@ pub async fn handle_messages(
                 } else {
                     e
                 };
+                last_error = format!("No available accounts: {}", safe_message);
+                last_status = StatusCode::SERVICE_UNAVAILABLE;
+
+                if is_opus_46_thinking_model(&mapped_model) && attempt + 1 < max_attempts {
+                    let cooldown = activate_opus_fallback(503);
+                    tracing::warn!(
+                        "[{}] No Opus account available ({}); falling back to {} for {}s",
+                        trace_id,
+                        safe_message,
+                        OPUS_FALLBACK_MODEL,
+                        cooldown
+                    );
+                    force_rotate = true;
+                    continue;
+                }
+
                 let headers = [("X-Mapped-Model", mapped_model.as_str())];
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1148,7 +1567,7 @@ pub async fn handle_messages(
         // 4. 上游调用 - 自动转换逻辑
         let client_wants_stream = request.stream;
         // [AUTO-CONVERSION] 非 Stream 请求自动转换为 Stream 以享受更宽松的配额
-        let force_stream_internally = !client_wants_stream;
+        let force_stream_internally = !client_wants_stream && !direct_non_stream;
         let actual_stream = client_wants_stream || force_stream_internally;
 
         if force_stream_internally {
@@ -1213,6 +1632,7 @@ pub async fn handle_messages(
                     max_attempts,
                     e
                 );
+                force_rotate = true;
                 continue;
             }
         };
@@ -1258,7 +1678,10 @@ pub async fn handle_messages(
         // 成功
         if status.is_success() {
             // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
+            token_manager.mark_account_success_for_model(
+                &email,
+                Some(&request_with_mapped.model),
+            );
 
             // Determine context limit based on model
             let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(
@@ -1311,6 +1734,7 @@ pub async fn handle_messages(
                 );
 
                 let mut first_data_chunk = None;
+                let mut peek_prefix = Vec::new();
                 let mut retry_this_account = false;
 
                 // Loop to skip heartbeats during peek
@@ -1333,9 +1757,28 @@ pub async fn handle_messages(
                                 continue;
                             }
 
-                            // We found real data!
-                            first_data_chunk = Some(bytes);
-                            break;
+                            match classify_claude_stream_chunk(&bytes) {
+                                ClaudePeekDisposition::Error => {
+                                    tracing::warn!(
+                                        "[{}] Upstream emitted an SSE error before content; rotating account",
+                                        trace_id
+                                    );
+                                    last_error = format!(
+                                        "Upstream SSE error during peek: {}",
+                                        text.trim()
+                                    );
+                                    retry_this_account = true;
+                                    break;
+                                }
+                                ClaudePeekDisposition::Ignore => {
+                                    peek_prefix.push(bytes);
+                                    continue;
+                                }
+                                ClaudePeekDisposition::Meaningful => {
+                                    first_data_chunk = Some(bytes);
+                                    break;
+                                }
+                            }
                         }
                         Ok(Some(Err(e))) => {
                             tracing::warn!(
@@ -1369,6 +1812,7 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
+                    force_rotate = true;
                     continue;
                 }
 
@@ -1376,14 +1820,28 @@ pub async fn handle_messages(
                     Some(bytes) => {
                         // We have data! Construct the combined stream
                         let stream_rest = claude_stream;
-                        let combined_stream = futures::stream::once(async move { Ok(bytes) })
+                        let combined_stream = futures::stream::iter(
+                            peek_prefix
+                                .into_iter()
+                                .map(Ok::<Bytes, std::io::Error>),
+                        )
+                            .chain(futures::stream::once(async move { Ok(bytes) }))
                             .chain(stream_rest.map(|result| -> Result<Bytes, std::io::Error> {
                                 match result {
                                     Ok(b) => Ok(b),
-                                    Err(e) => Ok(Bytes::from(format!(
-                                        "data: {{\"error\":\"{}\"}}\n\n",
-                                        e
-                                    ))),
+                                    Err(e) => {
+                                        let error_event = serde_json::json!({
+                                            "type": "error",
+                                            "error": {
+                                                "type": "api_error",
+                                                "message": e.to_string()
+                                            }
+                                        });
+                                        Ok(Bytes::from(format!(
+                                            "event: error\ndata: {}\n\n",
+                                            error_event
+                                        )))
+                                    }
                                 }
                             }));
 
@@ -1396,7 +1854,17 @@ pub async fn handle_messages(
                                     Ok(None) => break,
                                     Err(_) => {
                                         tracing::error!("[Claude-SSE] Idle timeout after 300s, terminating stream");
-                                        yield Ok::<Bytes, std::io::Error>(Bytes::from("data: {\"type\": \"message_stop\"}\n\ndata: [DONE]\n\n"));
+                                        let error_event = serde_json::json!({
+                                            "type": "error",
+                                            "error": {
+                                                "type": "timeout_error",
+                                                "message": "Claude upstream stream idle timeout before completion"
+                                            }
+                                        });
+                                        yield Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                                            "event: error\ndata: {}\n\n",
+                                            error_event
+                                        )));
                                         break;
                                     }
                                 }
@@ -1425,7 +1893,8 @@ pub async fn handle_messages(
                             use crate::proxy::mappers::claude::collect_stream_to_json;
 
                             match collect_stream_to_json(Box::pin(combined_stream)).await {
-                                Ok(full_response) => {
+                                Ok(mut full_response) => {
+                                    ensure_claude_usage(&mut full_response, &request_with_mapped);
                                     info!(
                                         "[{}] ✓ Stream collected and converted to JSON",
                                         trace_id
@@ -1445,11 +1914,11 @@ pub async fn handle_messages(
                                         .unwrap();
                                 }
                                 Err(e) => {
-                                    return (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("Stream collection error: {}", e),
-                                    )
-                                        .into_response();
+                                    error!("[{}] Stream collection error: {}", trace_id, e);
+                                    last_error = format!("Stream collection error: {e}");
+                                    token_manager.record_failure(&account_id);
+                                    force_rotate = true;
+                                    continue;
                                 }
                             }
                         }
@@ -1461,6 +1930,7 @@ pub async fn handle_messages(
                             trace_id
                         );
                         last_error = "Empty response stream (None)".to_string();
+                        force_rotate = true;
                         continue;
                     }
                 }
@@ -1469,11 +1939,10 @@ pub async fn handle_messages(
                 let bytes = match response.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            format!("Failed to read body: {}", e),
-                        )
-                            .into_response()
+                        last_error = format!("Failed to read Gemini response body: {e}");
+                        token_manager.record_failure(&account_id);
+                        force_rotate = true;
+                        continue;
                     }
                 };
 
@@ -1485,10 +1954,20 @@ pub async fn handle_messages(
                 let gemini_resp: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
                     Err(e) => {
-                        return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
-                            .into_response()
+                        last_error = format!("Failed to parse Gemini response: {e}");
+                        token_manager.record_failure(&account_id);
+                        force_rotate = true;
+                        continue;
                     }
                 };
+                if let Err(error) =
+                    super::common::validate_gemini_terminal_response(&gemini_resp)
+                {
+                    last_error = error;
+                    token_manager.record_failure(&account_id);
+                    force_rotate = true;
+                    continue;
+                }
 
                 // 解包 response 字段（v1internal 格式）
                 let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
@@ -1498,11 +1977,10 @@ pub async fn handle_messages(
                     match serde_json::from_value(raw.clone()) {
                         Ok(r) => r,
                         Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Convert error: {}", e),
-                            )
-                                .into_response()
+                            last_error = format!("Failed to decode Gemini response: {e}");
+                            token_manager.record_failure(&account_id);
+                            force_rotate = true;
+                            continue;
                         }
                     };
 
@@ -1516,7 +1994,7 @@ pub async fn handle_messages(
                 // [FIX #765] Pass session_id and model_name for signature caching
                 let s_id_owned = session_id.map(|s| s.to_string());
                 // 转换
-                let claude_response = match transform_response(
+                let mut claude_response = match transform_response(
                     &gemini_response,
                     scaling_enabled,
                     context_limit,
@@ -1533,6 +2011,7 @@ pub async fn handle_messages(
                             .into_response()
                     }
                 };
+                ensure_claude_usage(&mut claude_response, &request_with_mapped);
 
                 // [Optimization] 记录闭环日志：消耗情况
                 let cache_info = if let Some(cached) = claude_response.usage.cache_read_input_tokens
@@ -1619,6 +2098,76 @@ pub async fn handle_messages(
                     Some(&request_with_mapped.model),
                 )
                 .await;
+        }
+
+        // Opus capacity/rate-limit failures need a short account rotation window,
+        // not the generic multi-second backoff. After the fast attempts, route this
+        // request to Sonnet and keep a process-wide cooldown so concurrent callers
+        // do not stampede Opus. The cooldown is time based; once it expires Opus is
+        // selected again automatically.
+        if is_opus_46_thinking_model(&request_with_mapped.model)
+            && is_opus_fast_fail_status(status_code)
+        {
+            let opus_budget = if initial_opus_46 {
+                max_attempts.saturating_sub(1).max(1)
+            } else {
+                max_attempts
+            };
+            let fast_limit = opus_fast_retry_limit(status_code, opus_budget);
+
+            if attempt + 1 < fast_limit {
+                tracing::warn!(
+                    "[{}] Opus fast retry status={} attempt={}/{}, rotating after {}ms",
+                    trace_id,
+                    status_code,
+                    attempt + 1,
+                    fast_limit,
+                    OPUS_FAST_RETRY_DELAY_MS
+                );
+                force_rotate = true;
+                tokio::time::sleep(Duration::from_millis(OPUS_FAST_RETRY_DELAY_MS)).await;
+                continue;
+            }
+
+            let cooldown = activate_opus_fallback(status_code);
+            if attempt + 1 < max_attempts {
+                tracing::warn!(
+                    "[{}] Opus status={} persisted after {} fast attempts; fallback to {} for {}s",
+                    trace_id,
+                    status_code,
+                    fast_limit,
+                    OPUS_FALLBACK_MODEL,
+                    cooldown
+                );
+                force_rotate = true;
+                tokio::time::sleep(Duration::from_millis(OPUS_FAST_RETRY_DELAY_MS)).await;
+                continue;
+            }
+
+            let error_type = if status_code == 429 {
+                "rate_limit_error"
+            } else {
+                "overloaded_error"
+            };
+            return (
+                status,
+                [
+                    ("X-Account-Email", email.as_str()),
+                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                ],
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "id": "err_opus_capacity_fast_fail",
+                        "type": error_type,
+                        "message": format!(
+                            "claude-opus-4-6-thinking upstream returned HTTP {} across {} fast attempts: {}",
+                            status_code, fast_limit, last_error
+                        )
+                    }
+                })),
+            )
+                .into_response();
         }
 
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)
@@ -1959,40 +2508,6 @@ pub async fn handle_count_tokens(
         "output_tokens": 0
     }))
     .into_response()
-}
-
-#[cfg(test)]
-mod variant_tests {
-    use crate::proxy::common::variant_mapping;
-    use crate::proxy::mappers::claude::models::ThinkingConfig;
-
-    #[test]
-    fn claude_opus_preserves_client_budget_when_present() {
-        let client_budget = Some(32_768);
-        let spec = variant_mapping::resolve("claude-opus-4-6-thinking", client_budget)
-            .expect("Claude Opus 4.6 thinking must resolve");
-        let request_thinking = ThinkingConfig {
-            type_: "enabled".to_string(),
-            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
-            effort: None,
-        };
-
-        assert_eq!(request_thinking.budget_tokens, client_budget);
-    }
-
-    #[test]
-    fn claude_opus_falls_back_to_spec_budget_when_client_budget_is_absent() {
-        let client_budget = None;
-        let spec = variant_mapping::resolve("claude-opus-4-6-thinking", client_budget)
-            .expect("Claude Opus 4.6 thinking must resolve");
-        let request_thinking = ThinkingConfig {
-            type_: "enabled".to_string(),
-            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
-            effort: None,
-        };
-
-        assert_eq!(request_thinking.budget_tokens, Some(1_024));
-    }
 }
 
 // 移除已失效的简单单元测试，后续将补全完整的集成测试

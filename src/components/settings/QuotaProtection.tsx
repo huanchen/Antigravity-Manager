@@ -1,7 +1,12 @@
 import { Shield, Check } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { QuotaProtectionConfig } from '../../types/config';
-import { MODEL_CONFIG } from '../../config/modelConfig';
+import {
+    MODEL_CONFIG,
+    LEGACY_CLAUDE_QUOTA_MODEL,
+    SUPPORTED_CLAUDE_QUOTA_MODELS,
+    isSupportedClaudeQuotaModel,
+} from '../../config/modelConfig';
 
 interface QuotaProtectionProps {
     config: QuotaProtectionConfig;
@@ -13,9 +18,9 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
 
     const handleEnabledChange = (enabled: boolean) => {
         let newConfig = { ...config, enabled };
-        // 如果开启保护且勾选列表为空，则默认勾选 claude
+        // 如果开启保护且勾选列表为空，则默认勾选两个独立的 Claude 配额槽位。
         if (enabled && (!config.monitored_models || config.monitored_models.length === 0)) {
-            newConfig.monitored_models = ['claude'];
+            newConfig.monitored_models = [...SUPPORTED_CLAUDE_QUOTA_MODELS];
         }
         onChange(newConfig);
     };
@@ -27,7 +32,13 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
     };
 
     const toggleModel = (model: string) => {
-        const currentModels = config.monitored_models || [];
+        // Migrate the old single `claude` marker as soon as the user edits a
+        // checkbox, while preserving its effective coverage for both buckets.
+        const currentModels = (config.monitored_models || []).flatMap(model =>
+            model.toLowerCase() === LEGACY_CLAUDE_QUOTA_MODEL
+                ? [...SUPPORTED_CLAUDE_QUOTA_MODELS]
+                : [model],
+        );
         let newModels: string[];
 
         if (currentModels.includes(model)) {
@@ -44,7 +55,8 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
     const uniqueLabels = new Set<string>();
     const monitoredModelsOptions = Object.entries(MODEL_CONFIG)
         .filter(([id, config]) => {
-            if (id.includes('thinking')) return false;
+            if (id.startsWith('claude-') && !isSupportedClaudeQuotaModel(id)) return false;
+            if (!id.startsWith('claude-') && id.includes('thinking')) return false;
             const label = config.shortLabel || config.label;
             if (uniqueLabels.has(label)) return false;
             uniqueLabels.add(label);
@@ -122,7 +134,10 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
                         </div>
                         <div className="grid grid-cols-4 gap-2">
                             {monitoredModelsOptions.map((model) => {
-                                const isSelected = config.monitored_models?.includes(model.id);
+                                const isSelected = config.monitored_models?.some(selected =>
+                                    selected.toLowerCase() === model.id
+                                    || (selected.toLowerCase() === LEGACY_CLAUDE_QUOTA_MODEL && isSupportedClaudeQuotaModel(model.id)),
+                                );
                                 return (
                                     <div
                                         key={model.id}

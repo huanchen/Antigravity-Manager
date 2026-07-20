@@ -9,7 +9,12 @@ import { useTranslation } from 'react-i18next';
 import clsx from 'clsx';
 import { formatTimeRemaining, formatCompactNumber } from '../../utils/format';
 import { enterMiniMode, exitMiniMode } from '../../utils/windowManager';
-import { getModelDisplayName, findQuotaModel } from '../../config/modelConfig';
+import {
+    getModelDisplayName,
+    findQuotaModel,
+    CLAUDE_SONNET_QUOTA_MODEL,
+    CLAUDE_OPUS_QUOTA_MODEL,
+} from '../../config/modelConfig';
 import { getVersion } from '@tauri-apps/api/app';
 import { listen } from '@tauri-apps/api/event';
 
@@ -139,7 +144,8 @@ export default function MiniView() {
     const geminiProModel = findQuotaModel(currentAccount?.quota?.models, 'gemini-pro');
     const geminiFlashModel = findQuotaModel(currentAccount?.quota?.models, 'gemini-flash');
 
-    const claudeModel = findQuotaModel(currentAccount?.quota?.models, 'claude');
+    const claudeSonnetModel = findQuotaModel(currentAccount?.quota?.models, 'claude-sonnet');
+    const claudeOpusModel = findQuotaModel(currentAccount?.quota?.models, 'claude-opus');
 
     // Helper to render a model row
     const renderModelRow = (model: any, displayName: string, colorClass: string) => {
@@ -265,9 +271,10 @@ export default function MiniView() {
                                 <div className="space-y-4 !mt-0">
                                     {renderModelRow(geminiProModel, getModelDisplayName(geminiProModel), 'emerald')}
                                     {renderModelRow(geminiFlashModel, getModelDisplayName(geminiFlashModel), 'emerald')}
-                                    {renderModelRow(claudeModel, getModelDisplayName(claudeModel, t('common.claude_series', 'Claude 系列')), 'cyan')}
+                                    {renderModelRow(claudeSonnetModel, getModelDisplayName(claudeSonnetModel, CLAUDE_SONNET_QUOTA_MODEL), 'cyan')}
+                                    {renderModelRow(claudeOpusModel, getModelDisplayName(claudeOpusModel, CLAUDE_OPUS_QUOTA_MODEL), 'cyan')}
 
-                                    {!geminiProModel && !geminiFlashModel && !claudeModel && (
+                                    {!geminiProModel && !geminiFlashModel && !claudeSonnetModel && !claudeOpusModel && (
                                         <div className="text-center py-4 text-xs text-gray-400">
                                             No quota data available
                                         </div>

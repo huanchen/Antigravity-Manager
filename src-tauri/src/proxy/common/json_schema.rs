@@ -204,26 +204,91 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
             // 0. [NEW] 合并 allOf
             merge_all_of(map);
 
-            // 0.5 [NEW] 结构归一化 (Normalization)
-            // 针对某些 MCP 工具（如 pencil）误用 items 定义对象属性的情况进行修复。
-            // 如果 type=object 或包含 properties，但又定义了 items，Gemini 会因为 items 只能出现在 array 中而报错。
-            // 我们将 items 的内容“对齐”到 properties 中。
-            if map.get("type").and_then(|t| t.as_str()) == Some("object")
-                || map.contains_key("properties")
-            {
-                if let Some(items) = map.remove("items") {
-                    tracing::warn!("[Schema-Normalization] Found 'items' in an Object-like node. Moving content to 'properties'.");
-                    let target_props = map
-                        .entry("properties".to_string())
-                        .or_insert_with(|| json!({}));
-                    if let Some(target_map) = target_props.as_object_mut() {
-                        if let Some(source_map) = items.as_object() {
-                            for (k, v) in source_map {
-                                target_map.entry(k.clone()).or_insert_with(|| v.clone());
+            // Gemini's Schema proto does not support JSON Schema definitions
+            // or `const`.  Definitions are flattened before this recursive
+            // pass, but nested definitions can still survive under a child
+            // schema; remove them here as well so they cannot reach upstream.
+            map.remove("$defs");
+            map.remove("definitions");
+            map.remove("const");
+
+            // Gemini's Schema proto requires structural fields to agree with
+            // `type`, and rejects ARRAY nodes without an `items` schema.  Keep
+            // an explicitly declared type authoritative: some clients send an
+            // empty `properties` object alongside `type: ARRAY`, and turning
+            // that node into OBJECT changes the tool's argument contract.
+            let declared_type = map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value.to_ascii_lowercase());
+            match declared_type.as_deref() {
+                Some("array") => {
+                    map.insert("type".to_string(), Value::String("array".to_string()));
+                    if map.remove("properties").is_some() {
+                        tracing::warn!(
+                            "[Schema-Normalization] Dropping properties from an ARRAY schema"
+                        );
+                    }
+                    if map
+                        .get("items")
+                        .map(|items| !items.is_object())
+                        .unwrap_or(true)
+                    {
+                        map.insert("items".to_string(), json!({ "type": "string" }));
+                    }
+                }
+                Some("object") => {
+                    map.insert("type".to_string(), Value::String("object".to_string()));
+                    if let Some(items) = map.remove("items") {
+                        // Preserve the historical repair for malformed object
+                        // schemas that used `items` as a property map, but do
+                        // not move a normal item schema (for example
+                        // `{type: string}`) into object properties.
+                        let property_map = items.as_object().filter(|source| {
+                            !source.contains_key("type")
+                                && !source.contains_key("properties")
+                                && !source.contains_key("items")
+                                && source.values().all(Value::is_object)
+                        });
+                        if let Some(source) = property_map {
+                            let target = map
+                                .entry("properties".to_string())
+                                .or_insert_with(|| json!({}));
+                            if let Some(target) = target.as_object_mut() {
+                                for (key, schema) in source {
+                                    target.entry(key.clone()).or_insert_with(|| schema.clone());
+                                }
                             }
+                        } else {
+                            tracing::warn!(
+                                "[Schema-Normalization] Dropping items from an OBJECT schema"
+                            );
                         }
                     }
                 }
+                Some("string" | "number" | "integer" | "boolean" | "null") => {
+                    map.insert(
+                        "type".to_string(),
+                        Value::String(declared_type.clone().unwrap_or_default()),
+                    );
+                    map.remove("properties");
+                    map.remove("items");
+                }
+                _ if map.contains_key("properties") => {
+                    map.insert("type".to_string(), Value::String("object".to_string()));
+                    map.remove("items");
+                }
+                _ if map.contains_key("items") => {
+                    map.insert("type".to_string(), Value::String("array".to_string()));
+                    if map
+                        .get("items")
+                        .map(|items| !items.is_object())
+                        .unwrap_or(true)
+                    {
+                        map.insert("items".to_string(), json!({ "type": "string" }));
+                    }
+                }
+                _ => {}
             }
 
             // 1. [CRITICAL] 深度递归处理子项
@@ -277,6 +342,15 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
             // (JSON Schema allows boolean `items`, Gemini's Schema proto rejects it).
             if map.get("items").map(|i| !i.is_object()).unwrap_or(false) {
                 map.remove("items");
+            }
+            if map
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case("array"))
+                .unwrap_or(false)
+                && !map.contains_key("items")
+            {
+                map.insert("items".to_string(), json!({ "type": "string" }));
             }
             if let Some(items) = map.get_mut("items") {
                 // items 的内容必须是一个独立的 Schema 节点
@@ -1664,5 +1738,45 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Accepts: string | object"));
+    }
+
+    #[test]
+    fn compat_regression_normalizes_gemini_array_and_properties_shapes() {
+        let mut schema = json!({
+            "type": "OBJECT",
+            "properties": {
+                "rrule": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "byday": { "type": "ARRAY", "properties": {} },
+                        "bymonth": { "type": "ARRAY" }
+                    }
+                },
+                "script_args": { "type": "ARRAY", "items": true },
+                "scalar_with_properties": {
+                    "type": "STRING",
+                    "properties": { "value": { "type": "STRING" } }
+                }
+            }
+        });
+
+        clean_json_schema(&mut schema);
+
+        let byday = &schema["properties"]["rrule"]["properties"]["byday"];
+        assert_eq!(byday["type"], "array");
+        assert!(byday.get("properties").is_none());
+        assert_eq!(byday["items"]["type"], "string");
+
+        let bymonth = &schema["properties"]["rrule"]["properties"]["bymonth"];
+        assert_eq!(bymonth["type"], "array");
+        assert_eq!(bymonth["items"]["type"], "string");
+
+        let script_args = &schema["properties"]["script_args"];
+        assert_eq!(script_args["type"], "array");
+        assert_eq!(script_args["items"]["type"], "string");
+
+        let scalar = &schema["properties"]["scalar_with_properties"];
+        assert_eq!(scalar["type"], "string");
+        assert!(scalar.get("properties").is_none());
     }
 }

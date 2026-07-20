@@ -1,6 +1,51 @@
 use crate::proxy::monitor::ProxyRequestLog;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode};
 use std::path::PathBuf;
+
+// Retain enough payload for diagnosing long SSE responses while keeping each
+// persisted monitor body bounded.
+const MAX_LOG_BODY_BYTES: usize = 256 * 1024;
+const MAX_LOG_ERROR_BYTES: usize = 8 * 1024;
+const SQLITE_BUSY_TIMEOUT_MS: i64 = 15_000;
+const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
+const PROXY_DB_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const PROXY_DB_TARGET_BYTES: u64 = 90 * 1024 * 1024;
+const CAPACITY_TRIM_ROWS: usize = 1_000;
+
+fn truncate_text(value: &Option<String>, max_bytes: usize, field_name: &str) -> Option<String> {
+    let text = value.as_ref()?;
+    if text.len() <= max_bytes {
+        return Some(text.clone());
+    }
+
+    // Reserve room for the diagnostic suffix so the persisted field itself,
+    // rather than only its prefix, stays within the configured bound. The
+    // decimal width of `stored_bytes` depends on the chosen prefix, so solve
+    // the bound once more after constructing the suffix.
+    let suffix_prefix = |stored_bytes: usize| {
+        format!(
+            "\n...[{} truncated: original_bytes={}, stored_bytes={}]",
+            field_name,
+            text.len(),
+            stored_bytes
+        )
+    };
+    let mut end = max_bytes.min(text.len());
+    for _ in 0..3 {
+        let suffix_len = suffix_prefix(end).len();
+        let prefix_budget = max_bytes.saturating_sub(suffix_len);
+        let mut next_end = prefix_budget.min(text.len());
+        while next_end > 0 && !text.is_char_boundary(next_end) {
+            next_end -= 1;
+        }
+        if next_end == end {
+            break;
+        }
+        end = next_end;
+    }
+
+    Some(format!("{}{}", &text[..end], suffix_prefix(end)))
+}
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
     let data_dir = crate::modules::account::get_data_dir()?;
@@ -15,18 +60,99 @@ fn connect_db() -> Result<Connection, String> {
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
 
-    // Set busy timeout to 5000ms to avoid "database is locked" errors
-    conn.pragma_update(None, "busy_timeout", 5000)
+    // Give concurrent readers/writers a short window instead of failing immediately.
+    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
         .map_err(|e| e.to_string())?;
 
     // Synchronous NORMAL is faster and safe enough for WAL
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
 
+    conn.pragma_update(
+        None,
+        "journal_size_limit",
+        SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.pragma_update(None, "wal_autocheckpoint", 1_000_i64)
+        .map_err(|e| e.to_string())?;
+
+    let page_size: u64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let max_pages = (PROXY_DB_MAX_BYTES / page_size).max(1);
+    conn.pragma_update(None, "max_page_count", max_pages)
+        .map_err(|e| e.to_string())?;
+
     Ok(conn)
 }
 
+fn archive_oversized_db() -> Result<Option<PathBuf>, String> {
+    let db_path = get_proxy_db_path()?;
+    let size = match std::fs::metadata(&db_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if size <= PROXY_DB_MAX_BYTES {
+        return Ok(None);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let backup_path = db_path.with_file_name(format!("proxy_logs.db.rollback-{}", timestamp));
+    std::fs::rename(&db_path, &backup_path).map_err(|e| e.to_string())?;
+
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        if sidecar.exists() {
+            let backup_sidecar = PathBuf::from(format!("{}{}", backup_path.display(), suffix));
+            if let Err(error) = std::fs::rename(&sidecar, backup_sidecar) {
+                tracing::warn!(
+                    "Failed to archive proxy log sidecar {}: {}",
+                    sidecar.display(),
+                    error
+                );
+            }
+        }
+    }
+
+    Ok(Some(backup_path))
+}
+
+fn trim_for_capacity(conn: &Connection) -> Result<usize, String> {
+    let page_size: u64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let page_count: u64 = conn
+        .pragma_query_value(None, "page_count", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let free_pages: u64 = conn
+        .pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let used_bytes = page_count.saturating_sub(free_pages) * page_size;
+
+    if used_bytes < PROXY_DB_TARGET_BYTES {
+        return Ok(0);
+    }
+
+    conn.execute(
+        "DELETE FROM request_logs WHERE id IN (
+            SELECT id FROM request_logs ORDER BY timestamp ASC LIMIT ?1
+        )",
+        [CAPACITY_TRIM_ROWS],
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn init_db() -> Result<(), String> {
+    if let Some(backup_path) = archive_oversized_db()? {
+        tracing::warn!(
+            "Archived oversized proxy log database to {} before applying the 100 MB limit",
+            backup_path.display()
+        );
+    }
+
     // connect_db will initialize WAL mode and other pragmas
     let conn = connect_db()?;
 
@@ -84,8 +210,15 @@ pub fn init_db() -> Result<(), String> {
 
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
     let conn = connect_db()?;
+    let trimmed = trim_for_capacity(&conn)?;
+    if trimmed > 0 {
+        tracing::info!("Proxy log capacity cleanup removed {} oldest rows", trimmed);
+    }
+    let request_body = truncate_text(&log.request_body, MAX_LOG_BODY_BYTES, "request_body");
+    let response_body = truncate_text(&log.response_body, MAX_LOG_BODY_BYTES, "response_body");
+    let error = truncate_text(&log.error, MAX_LOG_ERROR_BYTES, "error");
 
-    conn.execute(
+    let insert = || conn.execute(
         "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
@@ -96,9 +229,9 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.status,
             log.duration,
             log.model,
-            log.error,
-            log.request_body,
-            log.response_body,
+            error,
+            request_body,
+            response_body,
             log.input_tokens,
             log.output_tokens,
             log.cached_tokens,
@@ -108,9 +241,80 @@ pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
             log.client_ip,
             log.username,
         ],
-    ).map_err(|e| e.to_string())?;
+    );
+
+    match insert() {
+        Ok(_) => {}
+        Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == ErrorCode::DiskFull => {
+            conn.execute(
+                "DELETE FROM request_logs WHERE id IN (
+                    SELECT id FROM request_logs ORDER BY timestamp ASC LIMIT ?1
+                )",
+                [CAPACITY_TRIM_ROWS * 2],
+            )
+            .map_err(|e| e.to_string())?;
+            insert().map_err(|e| e.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compat_regression_keeps_log_body_up_to_256_kib_unchanged() {
+        let body = Some("x".repeat(MAX_LOG_BODY_BYTES));
+        assert_eq!(
+            truncate_text(&body, MAX_LOG_BODY_BYTES, "response_body"),
+            body
+        );
+    }
+
+    #[test]
+    fn compat_regression_truncates_log_body_at_utf8_boundary() {
+        let original = "好".repeat(MAX_LOG_BODY_BYTES / 2);
+        let truncated = truncate_text(
+            &Some(original.clone()),
+            MAX_LOG_BODY_BYTES,
+            "response_body",
+        )
+        .unwrap();
+        let mut stored_bytes = MAX_LOG_BODY_BYTES;
+        for _ in 0..3 {
+            let suffix_len = format!(
+                "\n...[response_body truncated: original_bytes={}, stored_bytes={}]",
+                original.len(),
+                stored_bytes
+            )
+            .len();
+            let budget = MAX_LOG_BODY_BYTES.saturating_sub(suffix_len);
+            let next = budget - (budget % "好".len());
+            if next == stored_bytes {
+                break;
+            }
+            stored_bytes = next;
+        }
+
+        assert!(truncated.starts_with(&original[..stored_bytes]));
+        assert!(truncated.len() <= MAX_LOG_BODY_BYTES);
+        assert!(truncated.ends_with(&format!(
+            "...[response_body truncated: original_bytes={}, stored_bytes={}]",
+            original.len(),
+            stored_bytes
+        )));
+    }
+
+    #[test]
+    fn compat_regression_bounds_error_text_separately() {
+        let error = Some("x".repeat(MAX_LOG_ERROR_BYTES * 2));
+        let truncated = truncate_text(&error, MAX_LOG_ERROR_BYTES, "error").unwrap();
+        assert!(truncated.len() <= MAX_LOG_ERROR_BYTES);
+        assert!(truncated.contains("[error truncated:"));
+    }
 }
 
 /// Get logs summary (without large request_body and response_body fields) with pagination
@@ -232,7 +436,7 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
 pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
     let conn = connect_db()?;
 
-    let cutoff_timestamp = chrono::Utc::now().timestamp() - (days * 24 * 3600);
+    let cutoff_timestamp = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
 
     let deleted = conn
         .execute(
@@ -241,14 +445,10 @@ pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    // Execute VACUUM to reclaim disk space
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
-
     Ok(deleted)
 }
 
 /// Limit maximum log count (keep newest N records)
-#[allow(dead_code)]
 pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
     let conn = connect_db()?;
 
@@ -260,8 +460,6 @@ pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
             [max_count],
         )
         .map_err(|e| e.to_string())?;
-
-    conn.execute("VACUUM", []).map_err(|e| e.to_string())?;
 
     Ok(deleted)
 }

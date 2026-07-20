@@ -48,8 +48,10 @@ pub struct ScheduledWarmupConfig {
 fn default_warmup_models() -> Vec<String> {
     vec![
         "gemini-3-flash".to_string(),
-        "claude".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6-thinking".to_string(),
         "gemini-3-pro-high".to_string(),
+        "gemini-3-pro-image".to_string(),
         "gemini-3.1-flash-image".to_string(),
     ]
 }
@@ -78,16 +80,19 @@ pub struct QuotaProtectionConfig {
     /// Reserved quota percentage (1-99)
     pub threshold_percentage: u32,
 
-    /// List of monitored models (e.g. gemini-3-flash, gemini-3-pro-high, gemini-3.1-pro-high, claude-sonnet-4-6)
+    /// List of monitored models. Claude Sonnet and Opus use independent
+    /// protection buckets; the legacy `claude` marker remains readable.
     #[serde(default = "default_monitored_models")]
     pub monitored_models: Vec<String>,
 }
 
 fn default_monitored_models() -> Vec<String> {
     vec![
-        "claude".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6-thinking".to_string(),
         "gemini-3-pro-high".to_string(),
         "gemini-3-flash".to_string(),
+        "gemini-3-pro-image".to_string(),
         "gemini-3.1-flash-image".to_string(),
     ]
 }
@@ -120,8 +125,10 @@ fn default_pinned_models() -> Vec<String> {
     vec![
         "gemini-3-pro-high".to_string(),
         "gemini-3-flash".to_string(),
+        "gemini-3-pro-image".to_string(),
         "gemini-3.1-flash-image".to_string(),
-        "claude-sonnet-4-6-thinking".to_string(),
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6-thinking".to_string(),
     ]
 }
 

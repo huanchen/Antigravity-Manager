@@ -188,7 +188,7 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
     'claude-sonnet-4-6': {
         label: 'Claude 4.6',
         shortLabel: 'Claude 4.6',
-        protectedKey: 'claude',
+        protectedKey: 'claude-sonnet-4-6',
         Icon: Claude.Color,
         i18nKey: 'proxy.model.claude_sonnet',
         i18nDescKey: 'proxy.model.claude_sonnet',
@@ -198,7 +198,7 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
     'claude-sonnet-4-6-thinking': {
         label: 'Claude 4.6 TK',
         shortLabel: 'Claude 4.6 TK',
-        protectedKey: 'claude',
+        protectedKey: 'claude-sonnet-4-6',
         Icon: Claude.Color,
         i18nKey: 'proxy.model.claude_sonnet_thinking',
         i18nDescKey: 'proxy.model.claude_sonnet_thinking',
@@ -208,7 +208,7 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
     'claude-opus-4-6-thinking': {
         label: 'Claude Opus 4.6 TK',
         shortLabel: 'Claude Opus 4.6 TK',
-        protectedKey: 'claude',
+        protectedKey: 'claude-opus-4-6-thinking',
         Icon: Claude.Color,
         i18nKey: 'proxy.model.claude_opus_thinking',
         i18nDescKey: 'proxy.model.claude_opus_thinking',
@@ -328,6 +328,12 @@ export function sortModels<T extends { id: string }>(models: T[]): T[] {
 export {
     categorizeModel,
     getModelProtectionKey,
+    isQuotaModelProtected,
+    isSupportedClaudeQuotaModel,
+    CLAUDE_SONNET_QUOTA_MODEL,
+    CLAUDE_OPUS_QUOTA_MODEL,
+    LEGACY_CLAUDE_QUOTA_MODEL,
+    SUPPORTED_CLAUDE_QUOTA_MODELS,
     getModelDisplayName,
     findQuotaModel,
     findImageQuotaModel,

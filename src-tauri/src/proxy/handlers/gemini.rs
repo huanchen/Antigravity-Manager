@@ -5,13 +5,16 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use bytes::Bytes;
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
 
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account,
+    account_rotation_attempts, acquire_global_image_permit, acquire_image_account_permit,
+    apply_retry_strategy, determine_retry_strategy, image_max_attempts, is_retryable_image_error,
+    should_rotate_account,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
@@ -19,7 +22,390 @@ use crate::proxy::session_manager::SessionManager;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+#[derive(Default)]
+struct NativeStreamState {
+    saw_finish_reason: bool,
+    saw_prompt_block: bool,
+    saw_done: bool,
+    usage_metadata: Option<Value>,
+}
+
+/// Remove only visible thought text from a Gemini response. Signatures,
+/// function calls, inline data, usage metadata, and finish markers remain
+/// untouched so downstream tool continuations and billing stay valid.
+fn hide_gemini_thought_text(value: &mut Value) {
+    let target = if value.get("response").is_some() {
+        value.get_mut("response").expect("response exists")
+    } else {
+        value
+    };
+    let Some(candidates) = target.get_mut("candidates").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for candidate in candidates {
+        let Some(parts) = candidate
+            .get_mut("content")
+            .and_then(|content| content.get_mut("parts"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for part in parts {
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                if let Some(obj) = part.as_object_mut() {
+                    obj.remove("text");
+                }
+            }
+        }
+    }
+}
+
+fn hide_native_sse_line(line: &str) -> String {
+    let trimmed = line.trim();
+    let Some(data) = trimmed.strip_prefix("data:").map(str::trim) else {
+        return line.to_string();
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return line.to_string();
+    }
+    let Ok(mut payload) = serde_json::from_str::<Value>(data) else {
+        return line.to_string();
+    };
+    hide_gemini_thought_text(&mut payload);
+    format!("data: {}\n\n", serde_json::to_string(&payload).unwrap_or_else(|_| data.to_string()))
+}
+
+#[derive(Debug)]
+enum NativeLineAction {
+    Ignore,
+    Forward(String),
+    Done(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePeekDisposition {
+    Ignore,
+    Meaningful,
+    Error,
+}
+
+fn classify_native_peek_payload(payload: &Value) -> NativePeekDisposition {
+    let response = payload.get("response").unwrap_or(payload);
+    if payload.get("error").is_some_and(|error| !error.is_null())
+        || response.get("error").is_some_and(|error| !error.is_null())
+    {
+        return NativePeekDisposition::Error;
+    }
+    if response
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+    {
+        return NativePeekDisposition::Meaningful;
+    }
+
+    let meaningful = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate
+                    .get("finishReason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty())
+                    || candidate
+                        .get("content")
+                        .and_then(|content| content.get("parts"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                                    || part.get("functionCall").is_some()
+                                    || part.get("inlineData").is_some()
+                            })
+                        })
+            })
+        });
+    if meaningful {
+        NativePeekDisposition::Meaningful
+    } else {
+        NativePeekDisposition::Ignore
+    }
+}
+
+/// Inspect all complete frames accumulated during peek. A trailing partial JSON
+/// frame is left pending until more transport bytes arrive.
+fn classify_native_peek_buffer(buffer: &[u8]) -> Result<NativePeekDisposition, String> {
+    let mut meaningful = false;
+    let mut offset = 0;
+    while let Some(relative) = buffer[offset..].iter().position(|byte| *byte == b'\n') {
+        let end = offset + relative + 1;
+        let line = std::str::from_utf8(&buffer[offset..end])
+            .map_err(|error| format!("Invalid UTF-8 in Gemini SSE peek: {error}"))?;
+        offset = end;
+        let line = line.trim();
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            return Ok(if meaningful {
+                NativePeekDisposition::Meaningful
+            } else {
+                NativePeekDisposition::Error
+            });
+        }
+        let payload: Value = serde_json::from_str(data)
+            .map_err(|error| format!("Invalid Gemini SSE JSON during peek: {error}"))?;
+        match classify_native_peek_payload(&payload) {
+            NativePeekDisposition::Error => return Ok(NativePeekDisposition::Error),
+            NativePeekDisposition::Meaningful => meaningful = true,
+            NativePeekDisposition::Ignore => {}
+        }
+    }
+
+    let tail = &buffer[offset..];
+    if !tail.is_empty() {
+        match std::str::from_utf8(tail) {
+            Ok(line) => {
+                if let Some(data) = line.trim().strip_prefix("data:").map(str::trim) {
+                    if data == "[DONE]" {
+                        return Ok(if meaningful {
+                            NativePeekDisposition::Meaningful
+                        } else {
+                            NativePeekDisposition::Error
+                        });
+                    }
+                    if !data.is_empty() {
+                        match serde_json::from_str::<Value>(data) {
+                            Ok(payload) => match classify_native_peek_payload(&payload) {
+                                NativePeekDisposition::Error => {
+                                    return Ok(NativePeekDisposition::Error)
+                                }
+                                NativePeekDisposition::Meaningful => meaningful = true,
+                                NativePeekDisposition::Ignore => {}
+                            },
+                            Err(error) if error.is_eof() => {}
+                            Err(error) => {
+                                return Err(format!(
+                                    "Invalid Gemini SSE JSON during peek: {error}"
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) if error.error_len().is_none() => {}
+            Err(error) => return Err(format!("Invalid UTF-8 in Gemini SSE peek: {error}")),
+        }
+    }
+
+    Ok(if meaningful {
+        NativePeekDisposition::Meaningful
+    } else {
+        NativePeekDisposition::Ignore
+    })
+}
+
+fn native_error_sse(message: impl Into<String>) -> Bytes {
+    let error = json!({
+        "error": {
+            "code": 502,
+            "message": message.into(),
+            "status": "UPSTREAM_ERROR"
+        }
+    });
+    Bytes::from(format!("data: {}\n\n", error))
+}
+
+/// Validates and unwraps one complete upstream SSE line.
+///
+/// `[DONE]` only terminates framing. A Gemini response is complete only after a
+/// candidate supplied a non-empty `finishReason` (including `MAX_TOKENS`).
+fn process_native_sse_line(
+    line: &str,
+    state: &mut NativeStreamState,
+    session_id: &str,
+    model_name: &str,
+) -> Result<NativeLineAction, String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(NativeLineAction::Ignore);
+    }
+
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(NativeLineAction::Forward(format!("{line}\n\n")));
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(NativeLineAction::Ignore);
+    }
+
+    if data == "[DONE]" {
+        if state.saw_done {
+            return Ok(NativeLineAction::Ignore);
+        }
+        if !state.saw_finish_reason && !state.saw_prompt_block {
+            return Err(
+                "Gemini stream sent [DONE] without a candidate finishReason or prompt block"
+                    .to_string(),
+            );
+        }
+        state.saw_done = true;
+        return Ok(NativeLineAction::Done("data: [DONE]\n\n".to_string()));
+    }
+
+    let mut envelope: Value = serde_json::from_str(data)
+        .map_err(|e| format!("Invalid Gemini SSE JSON: {e}"))?;
+    if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
+        return Err(format!("Gemini upstream error: {error}"));
+    }
+
+    let envelope_usage = envelope.get("usageMetadata").cloned();
+    let response = envelope.get("response").unwrap_or(&envelope);
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+        return Err(format!("Gemini upstream error: {error}"));
+    }
+
+    if let Some(usage) = response
+        .get("usageMetadata")
+        .cloned()
+        .or_else(|| envelope_usage.clone())
+    {
+        crate::proxy::mappers::gemini::collector::merge_usage_value(
+            &mut state.usage_metadata,
+            usage,
+        );
+    }
+    if response
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty())
+    {
+        state.saw_prompt_block = true;
+    }
+
+    if let Some(candidates) = response.get("candidates").and_then(Value::as_array) {
+        for candidate in candidates {
+            if candidate
+                .get("finishReason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
+            {
+                state.saw_finish_reason = true;
+            }
+
+            if let Some(parts) = candidate
+                .get("content")
+                .and_then(|content| content.get("parts"))
+                .and_then(Value::as_array)
+            {
+                for part in parts {
+                    if let Some(signature) = part
+                        .get("thoughtSignature")
+                        .or_else(|| part.get("thought_signature"))
+                        .and_then(Value::as_str)
+                    {
+                        crate::proxy::SignatureCache::global().cache_session_signature(
+                            session_id,
+                            signature.to_string(),
+                            1,
+                        );
+                        debug!(
+                            "[Gemini-SSE] Cached signature (len: {}) for session: {}",
+                            signature.len(),
+                            session_id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut envelope, model_name);
+    let mut output = if let Some(mut inner) = envelope.get_mut("response").map(Value::take) {
+        if inner.get("usageMetadata").is_none() {
+            if let Some(usage) = envelope_usage {
+                inner["usageMetadata"] = usage;
+            }
+        }
+        inner
+    } else {
+        envelope
+    };
+    if let Some(usage) = state.usage_metadata.clone() {
+        output["usageMetadata"] = usage;
+    }
+    let output = serde_json::to_string(&output)
+        .map_err(|e| format!("Failed to serialize Gemini SSE response: {e}"))?;
+    Ok(NativeLineAction::Forward(format!("data: {output}\n\n")))
+}
+
+/// Drains complete SSE lines from a byte buffer. When `flush_tail` is true,
+/// the final unterminated line is processed as well.
+fn drain_native_sse_buffer(
+    buffer: &mut bytes::BytesMut,
+    state: &mut NativeStreamState,
+    session_id: &str,
+    model_name: &str,
+    flush_tail: bool,
+) -> Result<(Vec<String>, bool), String> {
+    drain_native_sse_buffer_with_options(
+        buffer,
+        state,
+        session_id,
+        model_name,
+        flush_tail,
+        false,
+    )
+}
+
+fn drain_native_sse_buffer_with_options(
+    buffer: &mut bytes::BytesMut,
+    state: &mut NativeStreamState,
+    session_id: &str,
+    model_name: &str,
+    flush_tail: bool,
+    hide_thinking_output: bool,
+) -> Result<(Vec<String>, bool), String> {
+    let mut output = Vec::new();
+
+    loop {
+        let line = if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            Some(buffer.split_to(newline + 1))
+        } else if flush_tail && !buffer.is_empty() {
+            Some(buffer.split_to(buffer.len()))
+        } else {
+            None
+        };
+        let Some(line) = line else {
+            break;
+        };
+        let line = std::str::from_utf8(&line)
+            .map_err(|e| format!("Invalid UTF-8 in Gemini SSE stream: {e}"))?;
+
+        match process_native_sse_line(line, state, session_id, model_name)? {
+            NativeLineAction::Ignore => {}
+            NativeLineAction::Forward(line) => output.push(if hide_thinking_output {
+                hide_native_sse_line(&line)
+            } else {
+                line
+            }),
+            NativeLineAction::Done(line) => {
+                output.push(line);
+                return Ok((output, true));
+            }
+        }
+    }
+
+    Ok((output, false))
+}
 
 /// 处理 generateContent 和 streamGenerateContent
 /// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
@@ -42,6 +428,9 @@ pub async fn handle_generate(
     ));
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     let debug_cfg = state.debug_logging.read().await.clone();
+    let experimental = state.experimental.read().await.clone();
+    let direct_non_stream = experimental.direct_non_stream;
+    let hide_thinking_output = experimental.hide_thinking_output;
 
     // [NEW] Detect Client Adapter
     let client_adapter = CLIENT_ADAPTERS
@@ -78,7 +467,7 @@ pub async fn handle_generate(
     }
     let client_wants_stream = method == "streamGenerateContent";
     // [AUTO-CONVERSION] 强制内部流式化
-    let force_stream_internally = !client_wants_stream;
+    let force_stream_internally = !client_wants_stream && !direct_non_stream;
     let is_stream = client_wants_stream || force_stream_internally;
 
     if force_stream_internally {
@@ -89,44 +478,79 @@ pub async fn handle_generate(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
     let mut force_rotate = false;
 
-    for attempt in 0..max_attempts {
-        // 3. 模型路由解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &model_name,
-            &*state.custom_mapping.read().await,
-        );
-        // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
-        let tools_val: Option<Vec<Value>> =
-            body.get("tools").and_then(|t| t.as_array()).map(|arr| {
-                let mut flattened = Vec::new();
-                for tool_entry in arr {
-                    if let Some(decls) = tool_entry
-                        .get("functionDeclarations")
-                        .and_then(|v| v.as_array())
-                    {
-                        flattened.extend(decls.iter().cloned());
-                    } else {
-                        flattened.push(tool_entry.clone());
-                    }
+    // Resolve request-level routing once before entering the retry loop.  This
+    // keeps the retry budget and image concurrency guards in scope for every
+    // attempt, while the concrete account model is still resolved below per
+    // account (some accounts expose different image checkpoints).
+    let base_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        &model_name,
+        &*state.custom_mapping.read().await,
+    );
+    let tools_val: Option<Vec<Value>> = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            let mut flattened = Vec::new();
+            for tool_entry in arr {
+                if let Some(decls) = tool_entry
+                    .get("functionDeclarations")
+                    .and_then(|v| v.as_array())
+                {
+                    flattened.extend(decls.iter().cloned());
+                } else {
+                    flattened.push(tool_entry.clone());
                 }
-                flattened
-            });
+            }
+            flattened
+        });
+    let config = crate::proxy::mappers::common_utils::resolve_request_config(
+        &model_name,
+        &base_mapped_model,
+        &tools_val,
+        None,        // size (not applicable for Gemini native protocol)
+        None,        // quality
+        None,        // image_size
+        Some(&body), // [NEW] Pass request body for imageConfig parsing
+    );
+    let is_image_request = config.request_type == "image_gen";
+    let max_attempts = if is_image_request {
+        image_max_attempts(pool_size)
+    } else {
+        account_rotation_attempts(pool_size)
+    };
 
-        let config = crate::proxy::mappers::common_utils::resolve_request_config(
-            &model_name,
-            &mapped_model,
-            &tools_val,
-            None,        // size (not applicable for Gemini native protocol)
-            None,        // quality
-            None,        // [NEW] image_size
-            Some(&body), // [NEW] Pass request body for imageConfig parsing
-        );
+    // Hold one global image permit across the complete request, including
+    // retries. The per-account permit below is acquired after each account is
+    // selected, allowing different accounts to make progress independently.
+    let _global_image_permit = if is_image_request {
+        match acquire_global_image_permit().await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                return Ok((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": {
+                            "code": 429,
+                            "message": error,
+                            "status": "RESOURCE_EXHAUSTED"
+                        }
+                    })),
+                )
+                    .into_response())
+            }
+        }
+    } else {
+        None
+    };
+
+    for attempt in 0..max_attempts {
+        // 3. Resolve the account-specific concrete model after token selection.
+        // The request-level config above supplies stable routing/request type.
 
         // 4. 获取 Token (使用准确的 request_type)
         // 提取 SessionId (粘性指纹)
@@ -152,11 +576,17 @@ pub async fn handle_generate(
         };
 
         let mapped_model = token_manager
-            .resolve_dynamic_model_for_account(&account_id, &mapped_model)
+            .resolve_dynamic_model_for_account(&account_id, &base_mapped_model)
             .await;
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
+
+        let _image_account_permit = if is_image_request {
+            Some(acquire_image_account_permit(&account_id).await)
+        } else {
+            None
+        };
 
         // 5. 包装请求 (project injection)
         // [FIX #765] Pass session_id to wrap_request for signature injection
@@ -230,6 +660,7 @@ pub async fn handle_generate(
                     max_attempts,
                     e
                 );
+                force_rotate = true;
                 continue;
             }
         };
@@ -283,7 +714,7 @@ pub async fn handle_generate(
             if is_stream {
                 use axum::body::Body;
                 use axum::response::Response;
-                use bytes::{Bytes, BytesMut};
+                use bytes::BytesMut;
                 use futures::StreamExt;
 
                 let meta = json!({
@@ -309,41 +740,65 @@ pub async fn handle_generate(
                 // [FIX #859] Implement peek logic for Gemini stream to prevent 0-token 200 OK
                 let mut first_chunk = None;
                 let mut retry_gemini = false;
+                let mut peek_buffer = bytes::BytesMut::new();
 
                 // [NEW] 实施双阶段超时：第一阶段为 FirstChunkTimeout (300s / 5min)
                 // 这精准对齐了官方 Worker 在模型冷启动（Initialization）阶段的极度耐心
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    response_stream.next(),
-                )
-                .await
-                {
-                    Ok(Some(Ok(bytes))) => {
-                        if bytes.is_empty() {
-                            tracing::warn!("[Gemini] Empty first chunk received, retrying...");
-                            retry_gemini = true;
-                        } else {
-                            first_chunk = Some(bytes);
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        response_stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(bytes))) => {
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            peek_buffer.extend_from_slice(&bytes);
+                            match classify_native_peek_buffer(&peek_buffer) {
+                                Ok(NativePeekDisposition::Ignore) => continue,
+                                Ok(NativePeekDisposition::Meaningful) => {
+                                    first_chunk = Some(peek_buffer.split().freeze());
+                                    break;
+                                }
+                                Ok(NativePeekDisposition::Error) => {
+                                    last_error =
+                                        "Gemini error or premature terminal during peek".to_string();
+                                    retry_gemini = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    last_error = error;
+                                    retry_gemini = true;
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    Ok(Some(Err(e))) => {
-                        tracing::warn!("[Gemini] Stream error during peek: {}, retrying...", e);
-                        last_error = format!("Stream error: {}", e);
-                        retry_gemini = true;
-                    }
-                    Ok(None) => {
-                        tracing::warn!("[Gemini] Stream ended immediately, retrying...");
-                        last_error = "Empty response".to_string();
-                        retry_gemini = true;
-                    }
-                    Err(_) => {
-                        tracing::warn!("[Gemini] First chunk timeout after 300s, retrying...");
-                        last_error = "First chunk timeout".to_string();
-                        retry_gemini = true;
+                        Ok(Some(Err(e))) => {
+                            tracing::warn!("[Gemini] Stream error during peek: {}, retrying...", e);
+                            last_error = format!("Stream error: {}", e);
+                            retry_gemini = true;
+                            break;
+                        }
+                        Ok(None) => {
+                            tracing::warn!("[Gemini] Stream ended during peek, retrying...");
+                            last_error = "Empty or lifecycle-only response".to_string();
+                            retry_gemini = true;
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("[Gemini] First meaningful chunk timeout after 300s, retrying...");
+                            last_error = "First meaningful chunk timeout".to_string();
+                            retry_gemini = true;
+                            break;
+                        }
                     }
                 }
 
                 if retry_gemini {
+                    token_manager.record_failure(&account_id);
+                    force_rotate = true;
                     continue;
                 }
 
@@ -352,8 +807,10 @@ pub async fn handle_generate(
                 let stream = async_stream::stream! {
                     let mut first_data = first_chunk;
                     let mut meta_sent = false;
+                    let mut native_state = NativeStreamState::default();
+                    let mut stream_failed = false;
 
-                    loop {
+                    'upstream: loop {
                         // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
                         // 官方 Worker 会将 TraceID 作为 SSE 流的第 0 个数据包下发
                         if !meta_sent {
@@ -376,7 +833,11 @@ pub async fn handle_generate(
                                 Ok(next_item) => next_item,
                                 Err(_) => {
                                     error!("[Gemini-SSE] Idle timeout after 300s, terminating stream");
-                                    None
+                                    stream_failed = true;
+                                    yield Ok::<Bytes, String>(native_error_sse(
+                                        "Gemini upstream stream idle timeout before completion"
+                                    ));
+                                    break 'upstream;
                                 }
                             }
                         };
@@ -385,92 +846,74 @@ pub async fn handle_generate(
                             Some(Ok(b)) => b,
                             Some(Err(e)) => {
                                 error!("[Gemini-SSE] Stream error: {}", e);
-                                let error_json = serde_json::json!({
-                                    "id": &s_id_for_stream,
-                                    "object": "chat.completion.chunk",
-                                    "model": &model_name_for_stream,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": format!("\n[Stream Error] {}", e)
-                                            },
-                                            "finish_reason": "error"
-                                        }
-                                    ]
-                                });
-                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
-                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
-                                break;
+                                stream_failed = true;
+                                yield Ok::<Bytes, String>(native_error_sse(format!(
+                                    "Gemini upstream stream error: {e}"
+                                )));
+                                break 'upstream;
                             }
-                            None => break,
+                            None => break 'upstream,
                         };
 
                         debug!("[Gemini-SSE] Received chunk: {} bytes", bytes.len());
                         buffer.extend_from_slice(&bytes);
-                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                            let line_raw = buffer.split_to(pos + 1);
-                            if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                let line = line_str.trim();
-                                if line.is_empty() { continue; }
-
-                                if line.starts_with("data: ") {
-                                    let json_part = line.trim_start_matches("data: ").trim();
-                                    if json_part == "[DONE]" {
-                                        yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
-                                        continue;
-                                    }
-
-                                    match serde_json::from_str::<Value>(json_part) {
-                                        Ok(mut json) => {
-                                            // [FIX #765] Extract thoughtSignature from stream
-                                            let inner_val = if json.get("response").is_some() {
-                                                json.get("response")
-                                            } else {
-                                                Some(&json)
-                                            };
-
-                                            if let Some(resp) = inner_val {
-                                                if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
-                                                    for cand in candidates {
-                                                        if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
-                                                            for part in parts {
-                                                                if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                                                    crate::proxy::SignatureCache::global()
-                                                                        .cache_session_signature(&s_id_for_stream, sig.to_string(), 1);
-                                                                    debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id_for_stream);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // [FIX #1522] Inject Tool ID into Stream Response
-                                            crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &model_name_for_stream);
-
-                                            // Unwrap v1internal response wrapper
-                                            if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                                                let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
-                                                yield Ok::<Bytes, String>(Bytes::from(new_line));
-                                            } else {
-                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&json).unwrap_or_default())));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            debug!("[Gemini-SSE] JSON parse error: {}, passing raw line", e);
-                                            yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
-                                        }
-                                    }
-                                } else {
-                                    // Non-data lines (comments, etc.)
-                                    yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
+                        match drain_native_sse_buffer_with_options(
+                            &mut buffer,
+                            &mut native_state,
+                            &s_id_for_stream,
+                            &model_name_for_stream,
+                            false,
+                            hide_thinking_output,
+                        ) {
+                            Ok((output, done)) => {
+                                for line in output {
+                                    yield Ok::<Bytes, String>(Bytes::from(line));
                                 }
-                            } else {
-                                // Non-UTF8 data? Just pass it through or skip
-                                debug!("[Gemini-SSE] Non-UTF8 line encountered");
-                                yield Ok::<Bytes, String>(line_raw.freeze());
+                                if done {
+                                    break 'upstream;
+                                }
                             }
+                            Err(e) => {
+                                stream_failed = true;
+                                yield Ok::<Bytes, String>(native_error_sse(e));
+                                break 'upstream;
+                            }
+                        }
+                    }
+
+                    // A final SSE data line may legally arrive without a trailing newline.
+                    if !stream_failed && !native_state.saw_done && !buffer.is_empty() {
+                        match drain_native_sse_buffer_with_options(
+                            &mut buffer,
+                            &mut native_state,
+                            &s_id_for_stream,
+                            &model_name_for_stream,
+                            true,
+                            hide_thinking_output,
+                        ) {
+                            Ok((output, _)) => {
+                                for line in output {
+                                    yield Ok::<Bytes, String>(Bytes::from(line));
+                                }
+                            }
+                            Err(e) => {
+                                stream_failed = true;
+                                yield Ok::<Bytes, String>(native_error_sse(e));
+                            }
+                        }
+                    }
+
+                    if !stream_failed {
+                        if !native_state.saw_finish_reason && !native_state.saw_prompt_block {
+                            yield Ok::<Bytes, String>(native_error_sse(
+                                "Gemini stream ended without a candidate finishReason or prompt block"
+                            ));
+                        } else if !native_state.saw_done {
+                            // A few upstream/proxy paths close cleanly after the
+                            // terminal candidate but omit the framing sentinel.
+                            // Emit it only after validating finishReason so native
+                            // clients can reliably release the response stream.
+                            yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
                         }
                     }
                 };
@@ -509,20 +952,32 @@ pub async fn handle_generate(
                         }
                         Err(e) => {
                             error!("Stream collection error: {}", e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response());
+                            last_error = format!("Stream collection error: {e}");
+                            token_manager.record_failure(&account_id);
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }
             }
 
-            let mut gemini_resp: Value = response
-                .json()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            let mut gemini_resp: Value = match response.json().await {
+                Ok(value) => value,
+                Err(error) => {
+                    last_error = format!("Failed to parse Gemini response: {error}");
+                    token_manager.record_failure(&account_id);
+                    force_rotate = true;
+                    continue;
+                }
+            };
+            if let Err(error) =
+                super::common::validate_gemini_terminal_response(&gemini_resp)
+            {
+                last_error = error;
+                token_manager.record_failure(&account_id);
+                force_rotate = true;
+                continue;
+            }
 
             // [FIX #1522] Inject Tool ID into Non-streaming Response
             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
@@ -546,8 +1001,10 @@ pub async fn handle_generate(
                             .and_then(|p| p.as_array())
                         {
                             for part in parts {
-                                if let Some(sig) =
-                                    part.get("thoughtSignature").and_then(|s| s.as_str())
+                                if let Some(sig) = part
+                                    .get("thoughtSignature")
+                                    .or_else(|| part.get("thought_signature"))
+                                    .and_then(|s| s.as_str())
                                 {
                                     crate::proxy::SignatureCache::global().cache_session_signature(
                                         &session_id,
@@ -560,6 +1017,10 @@ pub async fn handle_generate(
                         }
                     }
                 }
+            }
+
+            if hide_thinking_output {
+                hide_gemini_thought_text(&mut gemini_resp);
             }
 
             let unwrapped = unwrap_response(&gemini_resp);
@@ -602,6 +1063,51 @@ pub async fn handle_generate(
                 &payload,
             )
             .await;
+        }
+
+        if is_image_request {
+            if is_retryable_image_error(status_code, &error_text) {
+                tracing::warn!(
+                    "[Gemini-Images] Account {} returned {}, fast-cooling and rotating",
+                    email,
+                    status_code
+                );
+                token_manager.mark_image_error_fast_with_body(
+                    &account_id,
+                    status_code,
+                    Some(&mapped_model),
+                    Some(&error_text),
+                );
+                force_rotate = true;
+                if attempt + 1 < max_attempts {
+                    continue;
+                }
+            }
+
+            // 5xx is an upstream capacity issue, not evidence that every account
+            // is bad. Fail fast instead of fanning the same outage across the pool.
+            if matches!(status_code, 500 | 503 | 529) {
+                token_manager.mark_image_error_fast(
+                    &account_id,
+                    status_code,
+                    Some(&mapped_model),
+                );
+                return Ok((
+                    status,
+                    [
+                        ("X-Account-Email", email.as_str()),
+                        ("X-Mapped-Model", mapped_model.as_str()),
+                    ],
+                    Json(json!({
+                        "error": {
+                            "code": status_code,
+                            "message": error_text,
+                            "status": "UPSTREAM_ERROR"
+                        }
+                    })),
+                )
+                    .into_response());
+            }
         }
 
         // 确定重试策略
@@ -766,4 +1272,242 @@ pub async fn handle_count_tokens(
         })?;
 
     Ok(Json(json!({"totalTokens": 0})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_peek_waits_through_fragmented_and_usage_only_frames() {
+        let partial = br#"data: {"usageMetadata":{"promptTokenCount":2}}
+data: {"candidates":[{"content":{"parts":[{"text":"hel"#;
+        assert_eq!(
+            classify_native_peek_buffer(partial).expect("partial frame"),
+            NativePeekDisposition::Ignore
+        );
+
+        let complete = br#"data: {"usageMetadata":{"promptTokenCount":2}}
+data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}
+
+"#;
+        assert_eq!(
+            classify_native_peek_buffer(complete).expect("complete frame"),
+            NativePeekDisposition::Meaningful
+        );
+    }
+
+    #[test]
+    fn native_peek_rejects_error_before_content() {
+        let error = br#"data: {"error":{"code":500,"message":"failed"}}
+
+"#;
+        assert_eq!(
+            classify_native_peek_buffer(error).expect("error frame"),
+            NativePeekDisposition::Error
+        );
+    }
+
+    #[test]
+    fn native_line_requires_finish_reason_before_done() {
+        let mut state = NativeStreamState::default();
+        let error = process_native_sse_line(
+            "data: [DONE]",
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect_err("DONE alone must not complete a Gemini response");
+
+        assert!(error.contains("without a candidate finishReason"));
+        assert!(!state.saw_done);
+    }
+
+    #[test]
+    fn native_line_preserves_max_tokens_and_allows_done() {
+        let mut state = NativeStreamState::default();
+        let line = r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}}"#;
+
+        let output = process_native_sse_line(
+            line,
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect("valid finish event");
+        let NativeLineAction::Forward(output) = output else {
+            panic!("expected forwarded response");
+        };
+        assert!(output.contains("\"finishReason\":\"MAX_TOKENS\""));
+        assert!(state.saw_finish_reason);
+
+        let done = process_native_sse_line(
+            "data: [DONE]",
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect("DONE after finishReason is valid");
+        assert!(matches!(done, NativeLineAction::Done(_)));
+        assert!(state.saw_done);
+    }
+
+    #[test]
+    fn native_line_rejects_embedded_upstream_error() {
+        let mut state = NativeStreamState::default();
+        let error = process_native_sse_line(
+            r#"data: {"error":{"code":500,"message":"failed"}}"#,
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect_err("upstream error must terminate the stream");
+
+        assert!(error.contains("Gemini upstream error"));
+        assert!(!state.saw_finish_reason);
+    }
+
+    #[test]
+    fn native_prompt_feedback_block_allows_done() {
+        let mut state = NativeStreamState::default();
+        process_native_sse_line(
+            r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#,
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect("prompt block response");
+        assert!(state.saw_prompt_block);
+
+        let done = process_native_sse_line(
+            "data: [DONE]",
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect("DONE after prompt block is valid");
+        assert!(matches!(done, NativeLineAction::Done(_)));
+    }
+
+    #[test]
+    fn native_later_zero_usage_does_not_erase_real_counts() {
+        let mut state = NativeStreamState::default();
+        process_native_sse_line(
+            r#"data: {"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":7,"totalTokenCount":19}}"#,
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect("usage frame");
+        let output = process_native_sse_line(
+            r#"data: {"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}"#,
+            &mut state,
+            "native-test",
+            "gemini-test",
+        )
+        .expect("terminal frame");
+        let NativeLineAction::Forward(output) = output else {
+            panic!("expected forwarded response");
+        };
+        assert!(output.contains("\"promptTokenCount\":12"));
+        assert!(output.contains("\"candidatesTokenCount\":7"));
+        assert!(output.contains("\"totalTokenCount\":19"));
+    }
+
+    #[test]
+    fn native_buffer_handles_split_json_and_unterminated_tail() {
+        let mut state = NativeStreamState::default();
+        let mut buffer = bytes::BytesMut::new();
+        buffer.extend_from_slice(
+            b"data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel",
+        );
+        let (first_output, first_done) = drain_native_sse_buffer(
+            &mut buffer,
+            &mut state,
+            "native-test",
+            "gemini-test",
+            false,
+        )
+        .expect("partial line is buffered");
+        assert!(first_output.is_empty());
+        assert!(!first_done);
+
+        buffer.extend_from_slice(
+            b"lo\"}]},\"finishReason\":\"STOP\"}]}}",
+        );
+        let (output, done) = drain_native_sse_buffer(
+            &mut buffer,
+            &mut state,
+            "native-test",
+            "gemini-test",
+            true,
+        )
+        .expect("unterminated tail is processed at EOF");
+
+        assert_eq!(output.len(), 1);
+        assert!(output[0].contains("hello"));
+        assert!(!done);
+        assert!(state.saw_finish_reason);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn native_thought_filter_hides_text_but_keeps_signature_and_tools() {
+        let mut payload = json!({
+            "response": {
+                "candidates": [{
+                    "content": {"parts": [
+                        {"thought": true, "text": "private", "thoughtSignature": "sig"},
+                        {"text": "answer"},
+                        {"thought": true, "functionCall": {"name": "lookup", "args": {}}}
+                    ]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {"totalTokenCount": 3}
+            }
+        });
+        hide_gemini_thought_text(&mut payload);
+        let parts = payload["response"]["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts");
+        assert!(parts[0].get("text").is_none());
+        assert_eq!(parts[0]["thoughtSignature"], "sig");
+        assert_eq!(parts[1]["text"], "answer");
+        assert!(parts[2].get("functionCall").is_some());
+        assert_eq!(payload["response"]["usageMetadata"]["totalTokenCount"], 3);
+    }
+
+    #[test]
+    fn native_thought_filter_is_opt_in_at_sse_drain_boundary() {
+        let mut state = NativeStreamState::default();
+        let mut hidden_buffer = bytes::BytesMut::from(
+            &b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"private\"},{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}]}\n\n"[..],
+        );
+        let (hidden, _) = drain_native_sse_buffer_with_options(
+            &mut hidden_buffer,
+            &mut state,
+            "native-test",
+            "gemini-test",
+            false,
+            true,
+        )
+        .expect("hidden stream");
+        assert!(!hidden.join("").contains("private"));
+        assert!(hidden.join("").contains("answer"));
+
+        let mut visible_state = NativeStreamState::default();
+        let mut visible_buffer = bytes::BytesMut::from(
+            &b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"private\"},{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}]}\n\n"[..],
+        );
+        let (visible, _) = drain_native_sse_buffer_with_options(
+            &mut visible_buffer,
+            &mut visible_state,
+            "native-test",
+            "gemini-test",
+            false,
+            false,
+        )
+        .expect("visible stream");
+        assert!(visible.join("").contains("private"));
+    }
 }

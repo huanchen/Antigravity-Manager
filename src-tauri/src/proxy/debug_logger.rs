@@ -112,10 +112,9 @@ fn parse_sse_stream(raw: &str) -> (String, String) {
 
     for line in raw.lines() {
         let line = line.trim();
-        if !line.starts_with("data: ") {
+        let Some(json_str) = line.strip_prefix("data:").map(str::trim) else {
             continue;
-        }
-        let json_str = &line[6..]; // 去掉 "data: " 前缀
+        };
         if json_str.is_empty() || json_str == "[DONE]" {
             continue;
         }

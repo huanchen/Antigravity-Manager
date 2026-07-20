@@ -26,36 +26,51 @@ pub fn get_log_dir() -> Result<PathBuf, String> {
     Ok(log_dir)
 }
 
+fn file_logging_enabled() -> bool {
+    std::env::var("ABV_FILE_LOGGING")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Initialize the log system
 pub fn init_logger() {
     // Capture log macro logs
     let _ = tracing_log::LogTracer::init();
 
-    let log_dir = match get_log_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("Failed to initialize log directory: {}", e);
-            return;
-        }
+    let file_logging = file_logging_enabled();
+    let mut file_guard = None;
+    let file_layer = if file_logging {
+        let log_dir = match get_log_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("Failed to initialize log directory: {}", e);
+                return;
+            }
+        };
+        let file_appender = tracing_appender::rolling::daily(log_dir, "app.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        file_guard = Some(guard);
+        Some(
+            fmt::Layer::new()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_target(true)
+                .with_level(true)
+                .with_timer(LocalTimer),
+        )
+    } else {
+        None
     };
-
-    // 1. Set up file Appender (using tracing-appender for rolling logs)
-    // Using a daily rolling strategy here
-    let file_appender = tracing_appender::rolling::daily(log_dir, "app.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     // 2. Console output layer (using local timezone)
     let console_layer = fmt::Layer::new()
         .with_target(false)
         .with_thread_ids(false)
-        .with_level(true)
-        .with_timer(LocalTimer);
-
-    // 3. File output layer (disable ANSI formatting, use local timezone)
-    let file_layer = fmt::Layer::new()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_target(true)
         .with_level(true)
         .with_timer(LocalTimer);
 
@@ -73,15 +88,19 @@ pub fn init_logger() {
         .with(bridge_layer)
         .try_init();
 
-    // Leak _guard to ensure its lifetime lasts until program exit
-    // Recommended practice when using tracing_appender::non_blocking (if manual flushing is not needed)
-    std::mem::forget(_guard);
+    if let Some(guard) = file_guard {
+        std::mem::forget(guard);
+    }
 
-    info!("Log system initialized (Console + File persistence)");
+    info!(
+        "Log system initialized (console, file persistence: {})",
+        file_logging
+    );
 
-    // Auto-cleanup logs older than 7 days
-    if let Err(e) = cleanup_old_logs(7) {
-        warn!("Failed to cleanup old logs: {}", e);
+    if file_logging {
+        if let Err(e) = cleanup_old_logs(7) {
+            warn!("Failed to cleanup old logs: {}", e);
+        }
     }
 }
 

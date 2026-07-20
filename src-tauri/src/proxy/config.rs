@@ -358,6 +358,17 @@ impl Default for ZaiConfig {
 /// 实验性功能配置 (Feature Flags)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
+    /// Hide Gemini thought parts / OpenAI reasoning text while preserving
+    /// thought signatures, tool calls, usage, and terminal events.
+    #[serde(default = "default_true")]
+    pub hide_thinking_output: bool,
+
+    /// Use the upstream non-streaming endpoint when the client requests
+    /// `stream=false`. Keep this opt-in until the direct path has completed
+    /// the same terminal-frame and usage validation as the SSE collectors.
+    #[serde(default)]
+    pub direct_non_stream: bool,
+
     /// 启用双层签名缓存 (Signature Cache)
     #[serde(default = "default_true")]
     pub enable_signature_cache: bool,
@@ -397,6 +408,8 @@ pub struct ExperimentalConfig {
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
+            hide_thinking_output: true,
+            direct_non_stream: false,
             enable_signature_cache: true,
             enable_tool_loop_recovery: true,
             enable_cross_model_checks: true,
@@ -847,5 +860,12 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+
+    #[test]
+    fn legacy_experimental_config_keeps_stream_validation_by_default() {
+        let config: ExperimentalConfig =
+            serde_json::from_value(serde_json::json!({})).expect("experimental config");
+        assert!(!config.direct_non_stream);
     }
 }

@@ -486,6 +486,20 @@ impl StreamingState {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
             "max_tokens"
+        } else if matches!(
+            finish_reason,
+            Some(
+                "SAFETY"
+                    | "RECITATION"
+                    | "BLOCKLIST"
+                    | "PROHIBITED_CONTENT"
+                    | "SPII"
+                    | "IMAGE_SAFETY"
+                    | "IMAGE_PROHIBITED_CONTENT"
+                    | "PROMPT_BLOCKED"
+            )
+        ) {
+            "refusal"
         } else {
             "end_turn"
         };

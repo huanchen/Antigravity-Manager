@@ -504,11 +504,32 @@ impl NonStreamingProcessor {
             .as_ref()
             .and_then(|c| c.get(0))
             .and_then(|candidate| candidate.finish_reason.as_deref());
+        let prompt_blocked = gemini_response
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.get("blockReason"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| !reason.is_empty());
 
         let stop_reason = if self.has_tool_call {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
             "max_tokens"
+        } else if prompt_blocked
+            || matches!(
+                finish_reason,
+                Some(
+                    "SAFETY"
+                        | "RECITATION"
+                        | "BLOCKLIST"
+                        | "PROHIBITED_CONTENT"
+                        | "SPII"
+                        | "IMAGE_SAFETY"
+                        | "IMAGE_PROHIBITED_CONTENT"
+                )
+            )
+        {
+            "refusal"
         } else {
             "end_turn"
         };
@@ -578,11 +599,13 @@ mod tests {
             usage_metadata: Some(UsageMetadata {
                 prompt_token_count: Some(10),
                 candidates_token_count: Some(5),
+                thoughts_token_count: None,
                 total_token_count: Some(15),
                 cached_content_token_count: None,
             }),
             model_version: Some("gemini-2.5-flash".to_string()),
             response_id: Some("resp_123".to_string()),
+            prompt_feedback: None,
         };
 
         let result = transform_response(
@@ -640,6 +663,7 @@ mod tests {
             usage_metadata: None,
             model_version: Some("gemini-2.5-flash".to_string()),
             response_id: Some("resp_456".to_string()),
+            prompt_feedback: None,
         };
 
         let result = transform_response(
@@ -673,5 +697,34 @@ mod tests {
             }
             _ => panic!("Expected Text block"),
         }
+    }
+
+    #[test]
+    fn prompt_feedback_block_maps_to_refusal() {
+        let gemini_resp = GeminiResponse {
+            candidates: None,
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(4),
+                candidates_token_count: Some(0),
+                thoughts_token_count: Some(0),
+                total_token_count: Some(4),
+                cached_content_token_count: None,
+            }),
+            model_version: Some("gemini-2.5-flash".to_string()),
+            response_id: Some("resp_blocked".to_string()),
+            prompt_feedback: Some(serde_json::json!({ "blockReason": "SAFETY" })),
+        };
+
+        let response = transform_response(
+            &gemini_resp,
+            false,
+            1_000_000,
+            None,
+            "gemini-2.5-flash".to_string(),
+            1,
+        )
+        .expect("blocked response");
+        assert_eq!(response.stop_reason, "refusal");
+        assert!(response.content.is_empty());
     }
 }

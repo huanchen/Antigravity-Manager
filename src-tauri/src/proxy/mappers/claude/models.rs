@@ -253,6 +253,38 @@ pub struct Usage {
     pub server_tool_use: Option<serde_json::Value>,
 }
 
+impl Usage {
+    /// Merge cumulative usage frames without allowing a later placeholder
+    /// (for example `output_tokens: 0`) to erase a real terminal count.
+    pub fn merge_cumulative(&mut self, incoming: &Self) {
+        fn max_optional(slot: &mut Option<u32>, value: Option<u32>) {
+            if let Some(value) = value {
+                if slot.map(|current| value > current).unwrap_or(true) {
+                    *slot = Some(value);
+                }
+            }
+        }
+
+        if incoming.input_tokens > self.input_tokens {
+            self.input_tokens = incoming.input_tokens;
+        }
+        if incoming.output_tokens > self.output_tokens {
+            self.output_tokens = incoming.output_tokens;
+        }
+        max_optional(
+            &mut self.cache_read_input_tokens,
+            incoming.cache_read_input_tokens,
+        );
+        max_optional(
+            &mut self.cache_creation_input_tokens,
+            incoming.cache_creation_input_tokens,
+        );
+        if self.server_tool_use.is_none() && incoming.server_tool_use.is_some() {
+            self.server_tool_use = incoming.server_tool_use.clone();
+        }
+    }
+}
+
 // ========== Gemini 数据模型 ==========
 
 /// Gemini Content
@@ -327,6 +359,9 @@ pub struct GeminiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "responseId")]
     pub response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "promptFeedback")]
+    pub prompt_feedback: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,11 +387,86 @@ pub struct UsageMetadata {
     #[serde(rename = "candidatesTokenCount")]
     pub candidates_token_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "thoughtsTokenCount",
+        alias = "totalThoughtTokens",
+        alias = "total_thought_tokens"
+    )]
+    pub thoughts_token_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "totalTokenCount")]
     pub total_token_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "cachedContentTokenCount")]
     pub cached_content_token_count: Option<u32>,
+}
+
+impl UsageMetadata {
+    /// Usage counters in Gemini SSE frames are cumulative. Keep the greatest
+    /// observed value for each field so a final zero/empty placeholder cannot
+    /// turn a successful request into `0/0` in downstream monitors.
+    pub fn merge_cumulative(&mut self, incoming: &Self) {
+        fn max_optional(slot: &mut Option<u32>, value: Option<u32>) {
+            if let Some(value) = value {
+                if slot.map(|current| value > current).unwrap_or(true) {
+                    *slot = Some(value);
+                }
+            }
+        }
+
+        max_optional(&mut self.prompt_token_count, incoming.prompt_token_count);
+        max_optional(
+            &mut self.candidates_token_count,
+            incoming.candidates_token_count,
+        );
+        max_optional(&mut self.thoughts_token_count, incoming.thoughts_token_count);
+        max_optional(&mut self.total_token_count, incoming.total_token_count);
+        max_optional(
+            &mut self.cached_content_token_count,
+            incoming.cached_content_token_count,
+        );
+    }
+
+    pub fn output_token_count(&self) -> u32 {
+        let separated_output = self
+            .candidates_token_count
+            .unwrap_or(0)
+            .saturating_add(self.thoughts_token_count.unwrap_or(0));
+
+        // `totalTokenCount` is normally authoritative, but account metadata
+        // occasionally arrives as a placeholder pair such as prompt=0/total=0
+        // while candidate/thought counters are already populated. Do not let
+        // that zero erase real output. Conversely, when candidate tokens are
+        // already inclusive of thoughts, use the total equation to avoid
+        // double-counting them.
+        match self
+            .prompt_token_count
+            .zip(self.total_token_count)
+            .and_then(|(prompt, total)| total.checked_sub(prompt))
+        {
+            Some(total_output)
+                if total_output > 0
+                    || separated_output == 0
+                    || (self.candidates_token_count.unwrap_or(0) == 0
+                        && self.thoughts_token_count.unwrap_or(0) == 0) =>
+            {
+                let candidate_fits = self
+                    .candidates_token_count
+                    .map(|candidate| candidate <= total_output)
+                    .unwrap_or(true);
+                let thoughts_fit = self
+                    .thoughts_token_count
+                    .map(|thoughts| thoughts <= total_output)
+                    .unwrap_or(true);
+                if candidate_fits && thoughts_fit {
+                    total_output
+                } else {
+                    separated_output
+                }
+            }
+            _ => separated_output,
+        }
+    }
 }
 
 // ========== Grounding Metadata (for googleSearch results) ==========

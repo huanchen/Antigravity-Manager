@@ -1,7 +1,15 @@
 import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock, Clock } from 'lucide-react';
 import { Account } from '../../types/account';
 import { formatTimeRemaining } from '../../utils/format';
-import { findQuotaModel, getModelProtectionKey, getModelDisplayName, findImageQuotaModel } from '../../config/modelConfig';
+import {
+    findQuotaModel,
+    getModelProtectionKey,
+    getModelDisplayName,
+    findImageQuotaModel,
+    isQuotaModelProtected,
+    CLAUDE_SONNET_QUOTA_MODEL,
+    CLAUDE_OPUS_QUOTA_MODEL,
+} from '../../config/modelConfig';
 
 interface CurrentAccountProps {
     account: Account | null;
@@ -37,7 +45,8 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         : undefined;
     const isImageLiveLimited = Boolean(liveImageLimit && liveImageLimit.until > nowSeconds);
 
-    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
+    const claudeSonnetModel = findQuotaModel(account.quota?.models, 'claude-sonnet');
+    const claudeOpusModel = findQuotaModel(account.quota?.models, 'claude-opus');
 
     return (
         <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
@@ -180,36 +189,39 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     </div>
                 )}
 
-                {/* Claude 配额 */}
-                {claudeModel && (
-                    <div className="space-y-1.5">
+                {/* Claude Sonnet and Opus use independent quota/protection slots. */}
+                {[
+                    { model: claudeSonnetModel, label: 'Claude Sonnet', key: CLAUDE_SONNET_QUOTA_MODEL },
+                    { model: claudeOpusModel, label: 'Claude Opus', key: CLAUDE_OPUS_QUOTA_MODEL },
+                ].map(({ model, label, key }) => model && (
+                    <div key={key} className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
-                                {getModelDisplayName(claudeModel, t('common.claude_series', 'Claude 系列'))}
+                                {isQuotaModelProtected(account.protected_models, key) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {getModelDisplayName(model, label)}
                             </span>
                             <div className="flex items-center gap-2">
-                                <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(claudeModel.reset_time).toLocaleString()}`}>
-                                    {claudeModel.reset_time ? `R: ${formatTimeRemaining(claudeModel.reset_time)}` : t('common.unknown')}
+                                <span className="text-[10px] text-gray-400 dark:text-gray-500" title={`${t('accounts.reset_time')}: ${new Date(model.reset_time).toLocaleString()}`}>
+                                    {model.reset_time ? `R: ${formatTimeRemaining(model.reset_time)}` : t('common.unknown')}
                                 </span>
-                                <span className={`text-xs font-bold ${claudeModel.percentage >= 50 ? 'text-cyan-600 dark:text-cyan-400' :
-                                    claudeModel.percentage >= 20 ? 'text-orange-600 dark:text-orange-400' : 'text-rose-600 dark:text-rose-400'
+                                <span className={`text-xs font-bold ${model.percentage >= 50 ? 'text-cyan-600 dark:text-cyan-400' :
+                                    model.percentage >= 20 ? 'text-orange-600 dark:text-orange-400' : 'text-rose-600 dark:text-rose-400'
                                     }`}>
-                                    {claudeModel.percentage}%
+                                    {model.percentage}%
                                 </span>
                             </div>
                         </div>
                         <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5 overflow-hidden">
                             <div
-                                className={`h-full rounded-full transition-all duration-700 ${claudeModel.percentage >= 50 ? 'bg-gradient-to-r from-cyan-400 to-cyan-500' :
-                                    claudeModel.percentage >= 20 ? 'bg-gradient-to-r from-orange-400 to-orange-500' :
+                                className={`h-full rounded-full transition-all duration-700 ${model.percentage >= 50 ? 'bg-gradient-to-r from-cyan-400 to-cyan-500' :
+                                    model.percentage >= 20 ? 'bg-gradient-to-r from-orange-400 to-orange-500' :
                                         'bg-gradient-to-r from-rose-400 to-rose-500'
                                     }`}
-                                style={{ width: `${claudeModel.percentage}%` }}
+                                style={{ width: `${model.percentage}%` }}
                             ></div>
                         </div>
                     </div>
-                )}
+                ))}
             </div>
 
             {onSwitch && (

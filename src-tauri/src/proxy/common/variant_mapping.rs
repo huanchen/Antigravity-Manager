@@ -127,6 +127,16 @@ pub fn resolve_real_model(canonical: &str, tier: VariantTier) -> Option<RealMode
 /// Also accepts the real IDs themselves (idempotent passthrough).
 pub fn resolve_non_variant_model(model: &str) -> Option<RealModelSpec> {
     let key = model.to_lowercase();
+    // Physical checkpoint IDs are valid inputs too. Keep their calibrated
+    // budgets/limits when a client sends the resolved ID back on the next
+    // request instead of falling through to a generic 24k thinking default.
+    match key.as_str() {
+        "gemini-3.5-flash-extra-low" => return Some(SPEC_35_FLASH_EXTRA_LOW),
+        "gemini-3-flash-agent" => return Some(SPEC_3_FLASH_AGENT),
+        "gemini-3.1-pro-low" => return Some(SPEC_31_PRO_LOW),
+        "gemini-pro-agent" => return Some(SPEC_PRO_AGENT),
+        _ => {}
+    }
     // gemini-3.1-flash-lite: checkpoint-only model, no thinking.
     if matches!(
         key.as_str(),
@@ -134,7 +144,7 @@ pub fn resolve_non_variant_model(model: &str) -> Option<RealModelSpec> {
     ) {
         return Some(SPEC_31_FLASH_LITE);
     }
-    if key == "claude-sonnet-4-6" {
+    if matches!(key.as_str(), "claude-sonnet-4-6" | "claude-sonnet-4-6-thinking") {
         return Some(SPEC_CLAUDE_SONNET_46);
     }
     if matches!(key.as_str(), "claude-opus-4-6-thinking" | "claude-opus-4-6") {
@@ -155,6 +165,9 @@ pub fn resolve_with_tier(
     budget_tokens: Option<u32>,
 ) -> Option<RealModelSpec> {
     let tier = explicit_tier.unwrap_or_else(|| infer_tier(budget_tokens));
+    // Public aliases take precedence over checkpoint passthrough. In
+    // particular, `gemini-3.5-flash-low` is the documented low-tier alias and
+    // intentionally resolves to the extra-low checkpoint.
     resolve_real_model(canonical, tier).or_else(|| resolve_non_variant_model(canonical))
 }
 
@@ -429,6 +442,20 @@ mod tests {
         assert_eq!(s.id, "claude-sonnet-4-6");
         assert_eq!(s.thinking_budget, 1024);
         assert_eq!(s.max_output_tokens, 64000);
+    }
+
+    #[test]
+    fn unambiguous_physical_variant_ids_keep_their_calibrated_specs() {
+        for (id, budget) in [
+            ("gemini-3.5-flash-extra-low", 1000),
+            ("gemini-3-flash-agent", 10000),
+            ("gemini-3.1-pro-low", 1001),
+            ("gemini-pro-agent", 10001),
+        ] {
+            let spec = resolve(id, None).expect("physical variant must resolve");
+            assert_eq!(spec.id, id);
+            assert_eq!(spec.thinking_budget, budget);
+        }
     }
 
     #[test]

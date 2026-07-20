@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use tokio::sync::RwLock;
 
+const DB_LOG_RETENTION_DAYS: i64 = 7;
+const DB_MAX_LOG_ROWS: usize = 5_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
     pub id: String,
@@ -48,19 +51,38 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::task::spawn_blocking(
-            move || match crate::modules::proxy_db::cleanup_old_logs(30) {
+        // Keep synchronous SQLite maintenance off Tokio workers. VACUUM is
+        // intentionally omitted here because WAL/capacity maintenance already
+        // bounds disk usage without blocking live traffic.
+        tokio::task::spawn_blocking(move || {
+            match crate::modules::proxy_db::cleanup_old_logs(DB_LOG_RETENTION_DAYS) {
                 Ok(deleted) => {
                     if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
+                        tracing::info!(
+                            "Auto cleanup: removed {} old proxy logs (>{} days)",
+                            deleted,
+                            DB_LOG_RETENTION_DAYS
+                        );
                     }
                 }
                 Err(e) => {
                     tracing::error!("Failed to cleanup old logs: {}", e);
                 }
-            },
-        );
+            }
+
+            match crate::modules::proxy_db::limit_max_logs(DB_MAX_LOG_ROWS) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        tracing::info!(
+                            "Auto cleanup: trimmed {} proxy logs beyond newest {} rows",
+                            deleted,
+                            DB_MAX_LOG_ROWS
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("Failed to trim proxy logs: {}", e),
+            }
+        });
 
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),

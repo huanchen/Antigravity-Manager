@@ -4,7 +4,14 @@ import { getQuotaColor, formatTimeRemaining, getTimeRemainingColor } from '../..
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { formatCompactDuration, getLiveLimitForModel, getLiveLimitState } from '../../utils/liveLimit';
-import { getModelProtectionKey, findQuotaModel, findImageQuotaModel } from '../../config/modelConfig';
+import {
+    getModelProtectionKey,
+    findQuotaModel,
+    findImageQuotaModel,
+    isQuotaModelProtected,
+    CLAUDE_SONNET_QUOTA_MODEL,
+    CLAUDE_OPUS_QUOTA_MODEL,
+} from '../../config/modelConfig';
 
 interface AccountRowProps {
     account: Account;
@@ -46,7 +53,8 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
         ].filter(Boolean).join(' ')
         : 'Gemini 3.1 Flash Image';
 
-    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
+    const claudeSonnetModel = findQuotaModel(account.quota?.models, 'claude-sonnet');
+    const claudeOpusModel = findQuotaModel(account.quota?.models, 'claude-opus');
     const isDisabled = Boolean(account.disabled);
 
     // 颜色映射，避免动态类名被 Tailwind purge
@@ -271,37 +279,42 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             </div>
                         </div>
 
-                        {/* Claude */}
-                        <div className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
-                            {claudeModel && (
-                                <div
-                                    className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(claudeModel.percentage)}`}
-                                    style={{ width: `${claudeModel.percentage}%` }}
-                                />
-                            )}
-                            <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
-                                <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Claude Series">
-                                    {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
-                                    <span className="truncate">Claude</span>
-                                </span>
-                                <div className="flex-1 flex justify-center">
-                                    {claudeModel?.reset_time ? (
-                                        <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(claudeModel.reset_time))}>
-                                            <Clock className="w-2.5 h-2.5" />
-                                            {formatTimeRemaining(claudeModel.reset_time)}
-                                        </span>
-                                    ) : (
-                                        <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
-                                    )}
+                        {/* Claude Sonnet and Opus are separate upstream quota buckets. */}
+                        {[
+                            { model: claudeSonnetModel, label: 'Sonnet', key: CLAUDE_SONNET_QUOTA_MODEL },
+                            { model: claudeOpusModel, label: 'Opus', key: CLAUDE_OPUS_QUOTA_MODEL },
+                        ].map(({ model, label, key }) => (
+                            <div key={key} className="relative h-[22px] flex items-center px-1.5 rounded-md overflow-hidden border border-gray-100/50 dark:border-white/5 bg-gray-50/30 dark:bg-white/5 group/quota">
+                                {model && (
+                                    <div
+                                        className={`absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20 ${getColorClass(model.percentage)}`}
+                                        style={{ width: `${model.percentage}%` }}
+                                    />
+                                )}
+                                <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
+                                    <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={`Claude ${label}`}>
+                                        {isQuotaModelProtected(account.protected_models, key) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                        <span className="truncate">{label}</span>
+                                    </span>
+                                    <div className="flex-1 flex justify-center">
+                                        {model?.reset_time ? (
+                                            <span className={cn("flex items-center gap-0.5 font-medium transition-colors", getTimeColorClass(model.reset_time))}>
+                                                <Clock className="w-2.5 h-2.5" />
+                                                {formatTimeRemaining(model.reset_time)}
+                                            </span>
+                                        ) : (
+                                            <span className="text-gray-300 dark:text-gray-600 italic scale-90">N/A</span>
+                                        )}
+                                    </div>
+                                    <span className={cn("w-[36px] text-right font-bold transition-colors",
+                                        getQuotaColor(model?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
+                                            getQuotaColor(model?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
+                                    )}>
+                                        {model ? `${model.percentage}%` : '-'}
+                                    </span>
                                 </div>
-                                <span className={cn("w-[36px] text-right font-bold transition-colors",
-                                    getQuotaColor(claudeModel?.percentage || 0) === 'success' ? 'text-emerald-600 dark:text-emerald-400' :
-                                        getQuotaColor(claudeModel?.percentage || 0) === 'warning' ? 'text-amber-600 dark:text-amber-400' : 'text-rose-600 dark:text-rose-400'
-                                )}>
-                                    {claudeModel ? `${claudeModel.percentage}%` : '-'}
-                                </span>
                             </div>
-                        </div>
+                        ))}
                     </div>
                 )}
             </td>

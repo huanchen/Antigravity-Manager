@@ -1,7 +1,7 @@
 // 模型名称映射
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // 动态官方废弃模型转发表 (old_model_id -> new_model_id)
 pub static DYNAMIC_MODEL_FORWARDING_RULES: Lazy<DashMap<String, String>> =
@@ -22,14 +22,17 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 
     // 直接支持的模型
     m.insert("claude-sonnet-4-6", "claude-sonnet-4-6");
-    m.insert("claude-sonnet-4-6-thinking", "claude-sonnet-4-6-thinking");
+    // The upstream Claude Sonnet checkpoint is shared by the thinking and
+    // non-thinking Anthropic aliases; keep the synthetic suffix out of the
+    // v1internal model id while preserving thinking config separately.
+    m.insert("claude-sonnet-4-6-thinking", "claude-sonnet-4-6");
 
     // [Redirect] Sonnet 4.5 -> Sonnet 4.6
     m.insert("claude-sonnet-4-5", "claude-sonnet-4-6");
-    m.insert("claude-sonnet-4-5-thinking", "claude-sonnet-4-6-thinking");
+    m.insert("claude-sonnet-4-5-thinking", "claude-sonnet-4-6");
 
     // 别名映射
-    m.insert("claude-sonnet-4-5-20250929", "claude-sonnet-4-6-thinking");
+    m.insert("claude-sonnet-4-5-20250929", "claude-sonnet-4-6");
     m.insert("claude-3-5-sonnet-20241022", "claude-sonnet-4-6");
     m.insert("claude-3-5-sonnet-20240620", "claude-sonnet-4-6");
     // [Redirect] Opus 4.5 -> Opus 4.6 (Issue #1743)
@@ -71,17 +74,17 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     // Gemini 协议映射表
     m.insert("gemini-2.5-flash-lite", "gemini-2.5-flash");
     m.insert("gemini-2.5-flash-thinking", "gemini-2.5-flash-thinking");
-    // Gemini Pro family:
-    // - Concrete model IDs should pass through unchanged.
-    // - Generic aliases (without tier) still route to preview as fallback entrypoint.
+    // Gemini Pro family. The old preview entrypoints now return a generic
+    // INVALID_ARGUMENT response. Keep explicit tiers stable and route legacy /
+    // generic names to the conservative, verified low checkpoint.
     m.insert("gemini-3.1-pro-low", "gemini-3.1-pro-low");
     m.insert("gemini-3.1-pro-high", "gemini-pro-agent");
-    m.insert("gemini-3.1-pro-preview", "gemini-3.1-pro-preview");
-    m.insert("gemini-3.1-pro", "gemini-3.1-pro-preview");
+    m.insert("gemini-3.1-pro-preview", "gemini-3.1-pro-low");
+    m.insert("gemini-3.1-pro", "gemini-3.1-pro-low");
     m.insert("gemini-3-pro-low", "gemini-3-pro-low");
     m.insert("gemini-3-pro-high", "gemini-pro-agent");
-    m.insert("gemini-3-pro-preview", "gemini-3-pro-preview");
-    m.insert("gemini-3-pro", "gemini-3-pro-preview");
+    m.insert("gemini-3-pro-preview", "gemini-3.1-pro-low");
+    m.insert("gemini-3-pro", "gemini-3.1-pro-low");
     m.insert("gemini-2.5-flash", "gemini-2.5-flash");
     m.insert("gemini-3-flash", "gemini-3-flash");
     m.insert("gemini-3-pro-image", "gemini-3-pro-image");
@@ -311,8 +314,182 @@ pub fn resolve_model_route(
     result
 }
 
-/// Normalize any physical model name to one of the 3 standard protection IDs.
-/// This ensures quota protection works consistently regardless of API versioning or request variations.
+pub const SUPPORTED_CLAUDE_MODELS: [&str; 2] =
+    ["claude-sonnet-4-6", "claude-opus-4-6-thinking"];
+
+/// Canonicalize Claude aliases only when they map to a model exposed by the
+/// upstream quota catalog. Keeping Sonnet and Opus in separate buckets prevents
+/// an Opus capacity lock from accidentally suppressing Sonnet.
+pub fn canonical_supported_claude_model(model_name: &str) -> Option<&'static str> {
+    let lower = model_name
+        .trim()
+        .trim_start_matches("models/")
+        .to_ascii_lowercase();
+    match lower.as_str() {
+        "claude-sonnet-4-6" | "claude-sonnet-4-6-thinking" => Some("claude-sonnet-4-6"),
+        "claude-opus-4-6" | "claude-opus-4-6-thinking" => Some("claude-opus-4-6-thinking"),
+        _ => None,
+    }
+}
+
+pub fn is_supported_claude_model(model_name: &str) -> bool {
+    canonical_supported_claude_model(model_name).is_some()
+}
+
+pub fn is_legacy_claude_group(model_name: &str) -> bool {
+    matches!(
+        model_name.trim().to_ascii_lowercase().as_str(),
+        "claude" | "claude-sonnet" | "claude-opus"
+    )
+}
+
+pub fn expand_legacy_claude_group(model_name: &str) -> Vec<String> {
+    match model_name.trim().to_ascii_lowercase().as_str() {
+        "claude" => SUPPORTED_CLAUDE_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect(),
+        "claude-sonnet" => vec!["claude-sonnet-4-6".to_string()],
+        "claude-opus" => vec!["claude-opus-4-6-thinking".to_string()],
+        _ => vec![model_name.to_string()],
+    }
+}
+
+/// Resolve a configured quota-protection selector to the exact buckets used by
+/// scheduling. This accepts legacy family names and old versioned Claude names
+/// without coupling Sonnet and Opus again.
+pub fn quota_protection_targets(model_name: &str) -> Vec<String> {
+    let lower = model_name.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "claude" => SUPPORTED_CLAUDE_MODELS
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect(),
+        "claude-sonnet" => vec!["claude-sonnet-4-6".to_string()],
+        "claude-opus" => vec!["claude-opus-4-6-thinking".to_string()],
+        _ if lower.starts_with("claude-") && lower.contains("sonnet") => {
+            vec!["claude-sonnet-4-6".to_string()]
+        }
+        _ if lower.starts_with("claude-") && lower.contains("opus") => {
+            vec!["claude-opus-4-6-thinking".to_string()]
+        }
+        _ => vec![normalize_to_standard_id(&lower).unwrap_or(lower)],
+    }
+}
+
+fn managed_quota_protection_targets(marker: &str) -> Option<Vec<String>> {
+    let lower = marker.trim().to_ascii_lowercase();
+    let is_managed_family = lower == "claude"
+        || lower == "claude-sonnet"
+        || lower == "claude-opus"
+        || lower.starts_with("claude-")
+        || lower.starts_with("gemini-");
+    if !is_managed_family {
+        return None;
+    }
+
+    let targets = quota_protection_targets(&lower);
+    let all_known = targets.iter().all(|target| {
+        matches!(
+            target.as_str(),
+            "gemini-3-flash"
+                | "gemini-3-pro-high"
+                | "gemini-3-pro-image"
+                | "gemini-3.1-flash-image"
+                | "claude-sonnet-4-6"
+                | "claude-opus-4-6-thinking"
+        )
+    });
+    all_known.then_some(targets)
+}
+
+/// Drop stale system-managed protection markers after the monitored-model
+/// configuration changes. Unknown/custom markers are retained verbatim.
+pub fn reconcile_quota_protection_markers(
+    existing: &HashSet<String>,
+    configured_models: &[String],
+) -> HashSet<String> {
+    let monitored: HashSet<String> = configured_models
+        .iter()
+        .flat_map(|model| quota_protection_targets(model))
+        .collect();
+    let mut reconciled = HashSet::new();
+
+    for marker in existing {
+        if let Some(targets) = managed_quota_protection_targets(marker) {
+            for target in targets {
+                if monitored.contains(&target) {
+                    reconciled.insert(target);
+                }
+            }
+        } else {
+            reconciled.insert(marker.clone());
+        }
+    }
+
+    reconciled
+}
+
+fn claude_protection_bucket(model_name: &str) -> Option<&'static str> {
+    canonical_supported_claude_model(model_name).or_else(|| {
+        match model_name.trim().to_ascii_lowercase().as_str() {
+            "claude-sonnet" => Some("claude-sonnet-4-6"),
+            "claude-opus" => Some("claude-opus-4-6-thinking"),
+            _ => None,
+        }
+    })
+}
+
+pub fn protected_marker_matches(marker: &str, target: &str) -> bool {
+    if marker == target {
+        return true;
+    }
+
+    let target_bucket = claude_protection_bucket(target);
+    if marker.trim().eq_ignore_ascii_case("claude") {
+        return target_bucket.is_some();
+    }
+
+    claude_protection_bucket(marker).is_some_and(|marker_bucket| {
+        target_bucket.is_some_and(|target_bucket| marker_bucket == target_bucket)
+    })
+}
+
+/// Backward-compatible matching for old account files that stored one `claude`
+/// protection marker for both supported Claude models.
+pub fn protected_model_matches(
+    protected_models: &std::collections::HashSet<String>,
+    target: &str,
+) -> bool {
+    protected_models
+        .iter()
+        .any(|marker| protected_marker_matches(marker, target))
+}
+
+pub fn is_image_generation_model(model_name: &str) -> bool {
+    let lower = model_name.trim().to_ascii_lowercase();
+    lower.contains("image") || lower.contains("imagen")
+}
+
+/// Merge one physical model's quota into its normalized scheduling/protection
+/// bucket. Variants in the same bucket are interchangeable, so the bucket stays
+/// usable while at least one variant has quota.
+pub fn merge_standard_quota_max(
+    grouped: &mut HashMap<String, i32>,
+    model_name: &str,
+    percentage: i32,
+) {
+    if let Some(standard_id) = normalize_to_standard_id(model_name) {
+        grouped
+            .entry(standard_id)
+            .and_modify(|current| *current = (*current).max(percentage))
+            .or_insert(percentage);
+    }
+}
+
+/// Normalize any physical model name to a stable quota/rate-limit bucket.
+/// Gemini image/Pro/Flash families remain grouped as before; supported Claude
+/// models intentionally use separate exact buckets.
 ///
 /// Standard IDs:
 /// - `gemini-3-flash`: All Flash variants (1.5-flash, 2.5-flash, 3-flash, etc.)
@@ -328,7 +505,7 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     // 1. Image resources must keep Flash image and Pro image in separate quota buckets.
     // The quota API exposes `gemini-3.1-flash-image` separately, so grouping it under
     // `gemini-3-pro-image` makes available Flash image quota look exhausted.
-    if lower.contains("image") {
+    if is_image_generation_model(&lower) {
         if lower.contains("flash") {
             return Some("gemini-3.1-flash-image".to_string());
         }
@@ -345,7 +522,13 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
         return Some("gemini-3-pro-high".to_string());
     }
 
-    // 4. Claude 系列 (合并 Opus, Sonnet, Haiku 为统一保护组 'claude')
+    // 4. Claude: exact supported buckets. Keep a generic legacy bucket for old
+    // aliases/configuration values; request routing canonicalizes supported
+    // 4.5/4.6 aliases before scheduling, while this compatibility path keeps
+    // existing protected_models data readable.
+    if let Some(canonical) = canonical_supported_claude_model(&lower) {
+        return Some(canonical.to_string());
+    }
     if lower.contains("claude")
         || lower.contains("opus")
         || lower.contains("sonnet")
@@ -360,6 +543,7 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_model_mapping() {
@@ -374,7 +558,7 @@ mod tests {
         );
         assert_eq!(
             map_claude_model_to_gemini("claude-sonnet-4-5-thinking"),
-            "claude-sonnet-4-6-thinking"
+            "claude-sonnet-4-6"
         );
         assert_eq!(
             map_claude_model_to_gemini("claude-opus-4"),
@@ -403,24 +587,28 @@ mod tests {
             map_claude_model_to_gemini("gemini-3.1-pro-low"),
             "gemini-3.1-pro-low"
         );
-        // Generic aliases still map to preview entrypoint.
+        // Generic/preview aliases must avoid retired preview entrypoints.
         assert_eq!(
             map_claude_model_to_gemini("gemini-3-pro"),
-            "gemini-3-pro-preview"
+            "gemini-3.1-pro-low"
         );
         assert_eq!(
             map_claude_model_to_gemini("gemini-3.1-pro"),
-            "gemini-3.1-pro-preview"
+            "gemini-3.1-pro-low"
+        );
+        assert_eq!(
+            map_claude_model_to_gemini("gemini-3.1-pro-preview"),
+            "gemini-3.1-pro-low"
         );
 
-        // Test Normalization (Opus 4.6 now merged into "claude" group)
+        // Claude models use separate quota buckets so Opus capacity does not lock Sonnet.
         assert_eq!(
             normalize_to_standard_id("claude-opus-4-6-thinking"),
-            Some("claude".to_string())
+            Some("claude-opus-4-6-thinking".to_string())
         );
         assert_eq!(
-            normalize_to_standard_id("claude-sonnet-4-5"),
-            Some("claude".to_string())
+            normalize_to_standard_id("claude-sonnet-4-6-thinking"),
+            Some("claude-sonnet-4-6".to_string())
         );
 
         // [Regression] gemini-3-pro-image must NOT be grouped with gemini-3-pro-high
@@ -454,6 +642,76 @@ mod tests {
             normalize_to_standard_id("gemini-3.1-flash-image-4k"),
             Some("gemini-3.1-flash-image".to_string())
         );
+    }
+
+    #[test]
+    fn legacy_claude_groups_keep_sonnet_and_opus_independent() {
+        assert_eq!(
+            expand_legacy_claude_group("claude"),
+            vec![
+                "claude-sonnet-4-6".to_string(),
+                "claude-opus-4-6-thinking".to_string(),
+            ]
+        );
+        assert_eq!(
+            expand_legacy_claude_group("claude-sonnet"),
+            vec!["claude-sonnet-4-6".to_string()]
+        );
+        assert_eq!(
+            expand_legacy_claude_group("claude-opus"),
+            vec!["claude-opus-4-6-thinking".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_claude_protection_markers_match_only_their_family() {
+        let generic = HashSet::from(["claude".to_string()]);
+        assert!(protected_model_matches(&generic, "claude-sonnet-4-6"));
+        assert!(protected_model_matches(
+            &generic,
+            "claude-opus-4-6-thinking"
+        ));
+
+        let sonnet = HashSet::from(["claude-sonnet".to_string()]);
+        assert!(protected_model_matches(&sonnet, "claude-sonnet-4-6"));
+        assert!(!protected_model_matches(
+            &sonnet,
+            "claude-opus-4-6-thinking"
+        ));
+
+        let opus = HashSet::from(["claude-opus".to_string()]);
+        assert!(!protected_model_matches(&opus, "claude-sonnet-4-6"));
+        assert!(protected_model_matches(
+            &opus,
+            "claude-opus-4-6-thinking"
+        ));
+    }
+
+    #[test]
+    fn normalized_quota_group_uses_best_interchangeable_variant() {
+        let mut grouped = HashMap::new();
+        merge_standard_quota_max(&mut grouped, "gemini-3.1-pro-low", 0);
+        merge_standard_quota_max(&mut grouped, "gemini-3.1-pro-high", 100);
+        assert_eq!(grouped.get("gemini-3-pro-high"), Some(&100));
+        assert!(!grouped
+            .get("gemini-3-pro-high")
+            .is_some_and(|quota| *quota < 10));
+    }
+
+    #[test]
+    fn removed_monitored_models_drop_only_managed_protection_markers() {
+        let existing = HashSet::from([
+            "claude".to_string(),
+            "gemini-3-flash".to_string(),
+            "custom-provider-model".to_string(),
+        ]);
+        let configured = vec!["claude-sonnet".to_string()];
+
+        let reconciled = reconcile_quota_protection_markers(&existing, &configured);
+        assert!(reconciled.contains("claude-sonnet-4-6"));
+        assert!(!reconciled.contains("claude-opus-4-6-thinking"));
+        assert!(!reconciled.contains("gemini-3-flash"));
+        assert!(reconciled.contains("custom-provider-model"));
     }
 
     #[test]

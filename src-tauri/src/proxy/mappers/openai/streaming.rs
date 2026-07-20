@@ -32,88 +32,114 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
 /// Extract and convert Gemini usageMetadata to OpenAI usage format
 /// Supports both legacy v1internal format and new Interactions API format.
 ///
-/// Key semantic difference:
-/// - Old format: candidatesTokenCount = all output tokens (text + thinking + tool)
-/// - New format: total_output_tokens = text + tool output only; thought tokens are separate (total_thought_tokens)
-/// For Codex, we must sum them back together as `completion_tokens`.
+/// Gemini variants disagree on whether candidate output already includes hidden
+/// thoughts, so the shared mapper reconciles them against the reported total.
 fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
-    use super::models::{CompletionTokensDetails, OpenAIUsage, PromptTokensDetails};
-
-    // 优先使用新格式字段，fallback 到旧格式
-    let prompt_tokens = u
-        .get("total_input_tokens")
-        .or_else(|| u.get("promptTokenCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let raw_output_tokens = u
-        .get("total_output_tokens")
-        .or_else(|| u.get("candidatesTokenCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let raw_total_tokens = u
-        .get("total_tokens")
-        .or_else(|| u.get("totalTokenCount"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let cached_tokens = u
-        .get("total_cached_tokens")
-        .or_else(|| u.get("cachedContentTokenCount"))
-        .or_else(|| u.get("cachedTokens"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let reasoning_tokens = u
-        .get("total_thought_tokens")
-        .or_else(|| u.get("totalThoughtTokens"))
-        .or_else(|| u.get("thoughtsTokenCount"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let tool_use_tokens = u
-        .get("total_tool_use_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
-
-    // 新格式下 output_tokens 不含 thought/tool-use, 需要加回来。旧格式 candidatesTokenCount 已经包含它们
-    let has_new_format = u.get("total_output_tokens").is_some();
-    let completion_tokens = if has_new_format {
-        raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
-    } else {
-        raw_output_tokens
-    };
-
-    // cached_tokens is a subset of prompt_tokens. Keep prompt_tokens in the same
-    // raw-input-token unit as Gemini usageMetadata so downstream logs can reconcile it.
-    let final_total_tokens = raw_total_tokens.unwrap_or(prompt_tokens + completion_tokens);
-
-    Some(OpenAIUsage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: final_total_tokens,
-        prompt_tokens_details: cached_tokens.map(|ct| PromptTokensDetails {
-            cached_tokens: Some(ct),
-        }),
-        completion_tokens_details: reasoning_tokens.map(|rt| CompletionTokensDetails {
-            reasoning_tokens: Some(rt),
-        }),
-        input_tokens_by_modality,
-        raw_output_tokens: Some(raw_output_tokens),
-        total_thought_tokens: reasoning_tokens,
-        total_tool_use_tokens: tool_use_tokens,
-        gemini_total_tokens: raw_total_tokens,
-    })
+    Some(super::models::OpenAIUsage::from_gemini_metadata(u))
 }
 
-pub fn create_openai_sse_stream<S, E>(
+fn merge_usage_metadata(slot: &mut Option<super::models::OpenAIUsage>, metadata: &Value) {
+    let Some(incoming) = extract_usage_metadata(metadata) else {
+        return;
+    };
+    if let Some(current) = slot.as_mut() {
+        current.merge_max(incoming);
+    } else {
+        *slot = Some(incoming);
+    }
+}
+
+fn prompt_block_reason(response: &Value) -> Option<&str> {
+    response
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+}
+
+fn estimate_stream_tokens(text: &str) -> u32 {
+    let ascii = text.chars().filter(|ch| ch.is_ascii()).count() as u32;
+    let non_ascii = text.chars().filter(|ch| !ch.is_ascii()).count() as u32;
+    non_ascii.saturating_add((ascii.saturating_add(3)) / 4).max(1)
+}
+
+fn unwrap_gemini_stream_value(mut envelope: Value) -> Value {
+    let envelope_usage = envelope.get("usageMetadata").cloned();
+    if let Some(mut inner) = envelope.get_mut("response").map(Value::take) {
+        if inner.get("usageMetadata").is_none() {
+            if let Some(usage) = envelope_usage {
+                inner["usageMetadata"] = usage;
+            }
+        }
+        inner
+    } else {
+        envelope
+    }
+}
+
+/// Parse one complete Gemini SSE line without silently discarding malformed
+/// payloads. Transport fragmentation is normalized before this helper runs, so
+/// an invalid UTF-8 or JSON data line means the upstream response is corrupt.
+fn parse_gemini_sse_data_line(line_raw: &[u8]) -> Result<Option<Value>, String> {
+    let line = std::str::from_utf8(line_raw)
+        .map_err(|error| format!("Invalid UTF-8 in Gemini SSE frame: {error}"))?
+        .trim();
+
+    if line.is_empty()
+        || line.starts_with(':')
+        || line.starts_with("event:")
+        || line.starts_with("id:")
+        || line.starts_with("retry:")
+    {
+        return Ok(None);
+    }
+
+    let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+        return Ok(None);
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(None);
+    }
+
+    serde_json::from_str(data)
+        .map(Some)
+        .map_err(|error| format!("Invalid JSON in Gemini SSE frame: {error}"))
+}
+
+pub fn create_openai_sse_stream_with_options<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     model: String,
     session_id: String,
     message_count: usize,
     client_tool_names: Option<std::collections::HashSet<String>>,
+    hide_thinking_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    // Normalize transport chunks into complete SSE lines. Upstream frequently
+    // splits JSON in the middle of a frame, and some accounts omit the final
+    // newline; handing either shape to the mapper silently drops the tail.
+    let normalized_stream = async_stream::stream! {
+        let mut carry = BytesMut::new();
+        while let Some(item) = gemini_stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    carry.extend_from_slice(&bytes);
+                    while let Some(pos) = carry.iter().position(|byte| *byte == b'\n') {
+                        yield Ok::<Bytes, E>(carry.split_to(pos + 1).freeze());
+                    }
+                }
+                Err(error) => yield Err::<Bytes, E>(error),
+            }
+        }
+        if !carry.is_empty() {
+            carry.extend_from_slice(b"\n");
+            yield Ok::<Bytes, E>(carry.freeze());
+        }
+    };
+    let mut gemini_stream = Box::pin(normalized_stream);
     let mut buffer = BytesMut::new();
     let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_ts = Utc::now().timestamp();
@@ -125,12 +151,14 @@ where
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
+        let mut saw_finish_reason = false;
+        let mut usage_after_finish_emitted = false;
         let mut tool_call_index = 0;
 
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'stream_loop: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
                     match item {
@@ -138,16 +166,58 @@ where
                             buffer.extend_from_slice(&bytes);
                             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                                 let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
-                                    if line.is_empty() { continue; }
-                                    if line.starts_with("data: ") {
-                                        let json_part = line.trim_start_matches("data: ").trim();
-                                        if json_part == "[DONE]" { continue; }
-                                        if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                                            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                match parse_gemini_sse_data_line(&line_raw) {
+                                    Ok(Some(json)) => {
+                                            let actual_data = unwrap_gemini_stream_value(json);
                                             if let Some(u) = actual_data.get("usageMetadata") {
-                                                final_usage = extract_usage_metadata(u);
+                                                merge_usage_metadata(&mut final_usage, u);
+                                                if saw_finish_reason && !usage_after_finish_emitted {
+                                                    if let Some(ref usage) = final_usage {
+                                                        let usage_chunk = json!({
+                                                            "id": &stream_id,
+                                                            "object": "chat.completion.chunk",
+                                                            "created": created_ts,
+                                                            "model": &model,
+                                                            "choices": [{
+                                                                "index": 0,
+                                                                "delta": {},
+                                                                "finish_reason": Value::Null
+                                                            }],
+                                                            "usage": usage
+                                                        });
+                                                        yield Ok::<Bytes, String>(Bytes::from(format!(
+                                                            "data: {}\n\n",
+                                                            serde_json::to_string(&usage_chunk).unwrap_or_default()
+                                                        )));
+                                                        usage_after_finish_emitted = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if prompt_block_reason(&actual_data).is_some()
+                                                && !saw_finish_reason
+                                            {
+                                                let mut blocked_chunk = json!({
+                                                    "id": &stream_id,
+                                                    "object": "chat.completion.chunk",
+                                                    "created": created_ts,
+                                                    "model": &model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {},
+                                                        "finish_reason": "content_filter"
+                                                    }]
+                                                });
+                                                if let Some(ref usage) = final_usage {
+                                                    blocked_chunk["usage"] = serde_json::to_value(usage)
+                                                        .unwrap_or(Value::Null);
+                                                }
+                                                saw_finish_reason = true;
+                                                yield Ok::<Bytes, String>(Bytes::from(format!(
+                                                    "data: {}\n\n",
+                                                    serde_json::to_string(&blocked_chunk)
+                                                        .unwrap_or_default()
+                                                )));
                                             }
 
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -165,11 +235,13 @@ where
                                                             let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                                 let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
-                                                                if is_thought_part {
+                                                                if is_thought_part && !hide_thinking_output {
                                                                     // thought 内容只写入 thought_out（给支持 reasoning_content 的客户端），防止客户端重复显示思维过程
                                                                     thought_out.push_str(&clean_text);
                                                                 }
-                                                                else { content_out.push_str(&clean_text); }
+                                                                else if !is_thought_part {
+                                                                    content_out.push_str(&clean_text);
+                                                                }
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                                 store_thought_signature(sig, &session_id, message_count);
@@ -311,17 +383,38 @@ where
                                                             }]
                                                         });
                                                         if finish_reason.is_some() {
+                                                            saw_finish_reason = true;
                                                             if let Some(ref usage) = final_usage {
                                                                 openai_chunk["usage"] = serde_json::to_value(usage).unwrap();
                                                             }
                                                         }
-                                                        if finish_reason.is_some() { final_usage = None; }
                                                         let sse_out = format!("data: {}\n\n", serde_json::to_string(&openai_chunk).unwrap_or_default());
                                                         yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                     }
                                                 }
                                             }
-                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(parse_error) => {
+                                        tracing::error!("OpenAI stream framing error: {}", parse_error);
+                                        let error_chunk = json!({
+                                            "id": &stream_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_ts,
+                                            "model": &model,
+                                            "choices": [],
+                                            "error": {
+                                                "type": "upstream_error",
+                                                "message": parse_error,
+                                                "code": "upstream_malformed_stream"
+                                            }
+                                        });
+                                        yield Ok::<Bytes, String>(Bytes::from(format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&error_chunk).unwrap_or_default()
+                                        )));
+                                        error_occurred = true;
+                                        break 'stream_loop;
                                     }
                                 }
                             }
@@ -335,7 +428,6 @@ where
                                 "error": { "type": error_type, "message": user_msg, "code": "stream_error", "i18n_key": i18n_key }
                             });
                             yield Ok(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
-                            yield Ok(Bytes::from("data: [DONE]\n\n"));
                             error_occurred = true;
                             break;
                         }
@@ -352,35 +444,98 @@ where
         if !buffer.is_empty() {
             if let Ok(line_str) = std::str::from_utf8(&buffer) {
                 let line = line_str.trim();
-                if !line.is_empty() && line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part != "[DONE]" {
+                if !line.is_empty() {
+                    if let Some(json_part) = line.strip_prefix("data:").map(str::trim) {
+                        if json_part != "[DONE]" {
                         // Re-use logic for processing the last line
                         // (Note: In a more complex refactor we'd extract this to a function,
                         // but for a targeted fix, processing the terminal data chunk is safer)
-                        tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in buffer", buffer.len());
+                            tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in buffer", buffer.len());
+                        }
                     }
                 }
             }
         }
 
-        if !error_occurred {
+        if !error_occurred && saw_finish_reason {
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+        } else if !error_occurred {
+            let error_chunk = json!({
+                "id": &stream_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": &model,
+                "choices": [],
+                "error": {
+                    "type": "upstream_error",
+                    "message": "Gemini stream ended without finishReason.",
+                    "code": "upstream_interrupted"
+                }
+            });
+            yield Ok::<Bytes, String>(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&error_chunk).unwrap_or_default()
+            )));
         }
     };
     Box::pin(stream)
 }
 
-pub fn create_legacy_sse_stream<S, E>(
-    mut gemini_stream: Pin<Box<S>>,
+/// Chat-completions stream conversion with production-compatible defaults.
+/// Signatures are still cached even though visible thought deltas are hidden.
+pub fn create_openai_sse_stream<S, E>(
+    gemini_stream: Pin<Box<S>>,
     model: String,
     session_id: String,
     message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    create_openai_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        true,
+    )
+}
+
+pub fn create_legacy_sse_stream_with_options<S, E>(
+    mut gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    hide_thinking_output: bool,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    // Keep legacy Completions framing subject to the same line normalization as
+    // Chat/Responses. This prevents a final no-newline JSON frame from vanishing.
+    let normalized_stream = async_stream::stream! {
+        let mut carry = BytesMut::new();
+        while let Some(item) = gemini_stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    carry.extend_from_slice(&bytes);
+                    while let Some(pos) = carry.iter().position(|byte| *byte == b'\n') {
+                        yield Ok::<Bytes, E>(carry.split_to(pos + 1).freeze());
+                    }
+                }
+                Err(error) => yield Err::<Bytes, E>(error),
+            }
+        }
+        if !carry.is_empty() {
+            carry.extend_from_slice(b"\n");
+            yield Ok::<Bytes, E>(carry.freeze());
+        }
+    };
+    let mut gemini_stream = Box::pin(normalized_stream);
     let mut buffer = BytesMut::new();
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
@@ -396,10 +551,12 @@ where
     let stream = async_stream::stream! {
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
+        let mut saw_finish_reason = false;
+        let mut usage_after_finish_emitted = false;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'stream_loop: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
                     match item {
@@ -407,15 +564,60 @@ where
                             buffer.extend_from_slice(&bytes);
                             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                                 let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
-                                    if line.is_empty() { continue; }
-                                    if line.starts_with("data: ") {
-                                        let json_part = line.trim_start_matches("data: ").trim();
-                                        if json_part == "[DONE]" { continue; }
-                                        if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                                            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
-                                            if let Some(u) = actual_data.get("usageMetadata") { final_usage = extract_usage_metadata(u); }
+                                match parse_gemini_sse_data_line(&line_raw) {
+                                    Ok(Some(json)) => {
+                                            let actual_data = unwrap_gemini_stream_value(json);
+                                            if let Some(u) = actual_data.get("usageMetadata") {
+                                                merge_usage_metadata(&mut final_usage, u);
+                                                if saw_finish_reason && !usage_after_finish_emitted {
+                                                    if let Some(ref usage) = final_usage {
+                                                        let usage_chunk = json!({
+                                                            "id": &stream_id,
+                                                            "object": "text_completion",
+                                                            "created": created_ts,
+                                                            "model": &model,
+                                                            "choices": [{
+                                                                "index": 0,
+                                                                "text": "",
+                                                                "finish_reason": Value::Null
+                                                            }],
+                                                            "usage": usage
+                                                        });
+                                                        yield Ok::<Bytes, String>(Bytes::from(format!(
+                                                            "data: {}\n\n",
+                                                            serde_json::to_string(&usage_chunk).unwrap_or_default()
+                                                        )));
+                                                        usage_after_finish_emitted = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if prompt_block_reason(&actual_data).is_some()
+                                                && !saw_finish_reason
+                                            {
+                                                let mut blocked_chunk = json!({
+                                                    "id": &stream_id,
+                                                    "object": "text_completion",
+                                                    "created": created_ts,
+                                                    "model": &model,
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "text": "",
+                                                        "logprobs": null,
+                                                        "finish_reason": "content_filter"
+                                                    }]
+                                                });
+                                                if let Some(ref usage) = final_usage {
+                                                    blocked_chunk["usage"] = serde_json::to_value(usage)
+                                                        .unwrap_or(Value::Null);
+                                                }
+                                                saw_finish_reason = true;
+                                                yield Ok::<Bytes, String>(Bytes::from(format!(
+                                                    "data: {}\n\n",
+                                                    serde_json::to_string(&blocked_chunk)
+                                                        .unwrap_or_default()
+                                                )));
+                                            }
 
                                             let mut content_out = String::new();
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -425,7 +627,9 @@ where
                                                             let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                                 let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
-                                                                content_out.push_str(&clean_text);
+                                                                if !is_thought || !hide_thinking_output {
+                                                                    content_out.push_str(&clean_text);
+                                                                }
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                                 store_thought_signature(sig, &session_id, message_count);
@@ -444,9 +648,30 @@ where
                                                 "choices": [{ "text": content_out, "index": 0, "logprobs": null, "finish_reason": finish_reason }]
                                             });
                                             if let Some(ref usage) = final_usage { legacy_chunk["usage"] = serde_json::to_value(usage).unwrap(); }
-                                            if finish_reason.is_some() { final_usage = None; }
+                                            if finish_reason.is_some() { saw_finish_reason = true; }
                                             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&legacy_chunk).unwrap_or_default())));
-                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(parse_error) => {
+                                        tracing::error!("Legacy OpenAI stream framing error: {}", parse_error);
+                                        let error_chunk = json!({
+                                            "id": &stream_id,
+                                            "object": "text_completion",
+                                            "created": created_ts,
+                                            "model": &model,
+                                            "choices": [],
+                                            "error": {
+                                                "type": "upstream_error",
+                                                "message": parse_error,
+                                                "code": "upstream_malformed_stream"
+                                            }
+                                        });
+                                        yield Ok::<Bytes, String>(Bytes::from(format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&error_chunk).unwrap_or_default()
+                                        )));
+                                        error_occurred = true;
+                                        break 'stream_loop;
                                     }
                                 }
                             }
@@ -460,7 +685,6 @@ where
                                 "error": { "type": error_type, "message": user_msg, "code": "stream_error", "i18n_key": i18n_key }
                             });
                             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
-                            yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
                             error_occurred = true;
                             break;
                         }
@@ -470,11 +694,47 @@ where
                 _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
             }
         }
-        if !error_occurred {
+        if !error_occurred && saw_finish_reason {
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+        } else if !error_occurred {
+            let error_chunk = json!({
+                "id": &stream_id,
+                "object": "text_completion",
+                "created": created_ts,
+                "model": &model,
+                "choices": [],
+                "error": {
+                    "type": "upstream_error",
+                    "message": "Gemini stream ended without finishReason.",
+                    "code": "upstream_interrupted"
+                }
+            });
+            yield Ok::<Bytes, String>(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&error_chunk).unwrap_or_default()
+            )));
         }
     };
     Box::pin(stream)
+}
+
+pub fn create_legacy_sse_stream<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_legacy_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        true,
+    )
 }
 
 fn split_namespace_tool_name(qualified_name: &str) -> (String, Option<String>) {
@@ -546,17 +806,47 @@ fn codex_sse_frame(event: &Value) -> Bytes {
     Bytes::from(format!("event: {event_name}\ndata: {payload}\n\n"))
 }
 
-pub fn create_codex_sse_stream<S, E>(
+pub fn create_codex_sse_stream_with_options<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     model: String,
     session_id: String,
     message_count: usize,
     _assistant_turn_index: usize,
+    fallback_input_tokens: Option<u32>,
+    hide_thinking_output: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    // `reqwest::Response::bytes_stream()` is a byte stream, not an SSE-frame
+    // stream. A JSON event can be split at any byte boundary (and the final
+    // event may have no trailing newline). Normalize it before the Responses
+    // mapper sees it; otherwise the last fragment is silently discarded and
+    // clients receive a short/empty response even though the upstream request
+    // completed successfully.
+    let normalized_stream = async_stream::stream! {
+        let mut carry = BytesMut::new();
+        while let Some(item) = gemini_stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    carry.extend_from_slice(&bytes);
+                    while let Some(pos) = carry.iter().position(|byte| *byte == b'\n') {
+                        yield Ok::<Bytes, E>(carry.split_to(pos + 1).freeze());
+                    }
+                }
+                Err(error) => yield Err::<Bytes, E>(error),
+            }
+        }
+
+        // Flush an unterminated final SSE line. The inner parser can then use
+        // its normal line path and retain the terminal finish/usage event.
+        if !carry.is_empty() {
+            carry.extend_from_slice(b"\n");
+            yield Ok::<Bytes, E>(carry.freeze());
+        }
+    };
+    let mut gemini_stream = Box::pin(normalized_stream);
     let mut buffer = BytesMut::new();
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
@@ -604,6 +894,7 @@ where
         let mut accumulated_thinking = String::new();
         let mut has_seen_tool_calls = false;
         let mut final_finish_reason: Option<String> = None;
+        let mut stream_failure: Option<String> = None;
 
         let mut final_outputs_map: std::collections::BTreeMap<u32, serde_json::Value> = std::collections::BTreeMap::new();
         let mut next_output_index: u32 = 0;
@@ -613,7 +904,7 @@ where
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'stream_loop: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
                     match item {
@@ -621,17 +912,16 @@ where
                             buffer.extend_from_slice(&bytes);
                             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                                 let line_raw = buffer.split_to(pos + 1);
-                                if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                    let line = line_str.trim();
-                                    if line.is_empty() || !line.starts_with("data: ") { continue; }
-                                    let json_part = line.trim_start_matches("data: ").trim();
-                                    if json_part == "[DONE]" { continue; }
-
-                                    if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                                        let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                match parse_gemini_sse_data_line(&line_raw) {
+                                    Ok(Some(json)) => {
+                                        let actual_data = unwrap_gemini_stream_value(json);
 
                                         if let Some(u) = actual_data.get("usageMetadata") {
-                                            final_usage = extract_usage_metadata(u);
+                                            merge_usage_metadata(&mut final_usage, u);
+                                        }
+
+                                        if prompt_block_reason(&actual_data).is_some() {
+                                            final_finish_reason = Some("PROMPT_BLOCKED".to_string());
                                         }
 
                                         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -712,12 +1002,18 @@ where
                                                                     // commentary item.
                                                                     tracing::warn!("[Codex-Stream] Dropping late thought delta after assistant text started");
                                                                 } else if is_thought {
-                                                                    if !reasoning_open {
-                                                                        reasoning_output_index = next_output_index;
-                                                                        next_output_index += 1;
-                                                                        active_reasoning_item_id = format!("msg_thought_{}_{}", &random_str[..16], reasoning_item_seq);
-                                                                        reasoning_item_seq += 1;
-                                                                        accumulated_thinking.clear();
+                                                                    // Keep hidden thoughts in the internal accounting used for
+                                                                    // fallback usage, but only emit Responses reasoning events
+                                                                    // when the caller explicitly opts in.
+                                                                    if hide_thinking_output {
+                                                                        accumulated_thinking.push_str(&clean_text);
+                                                                    } else {
+                                                                        if !reasoning_open {
+                                                                            reasoning_output_index = next_output_index;
+                                                                            next_output_index += 1;
+                                                                            active_reasoning_item_id = format!("msg_thought_{}_{}", &random_str[..16], reasoning_item_seq);
+                                                                            reasoning_item_seq += 1;
+                                                                            accumulated_thinking.clear();
 
                                                                         let output_item_added = json!({"type": "response.output_item.added", "output_index": reasoning_output_index, "item": {"id": &active_reasoning_item_id, "type": "message", "role": "assistant", "phase": "commentary", "status": "in_progress", "content": []}});
                                                                         let output_item_added = inject_seq(output_item_added, &mut sequence_number);
@@ -727,10 +1023,10 @@ where
                                                                         let part_added = inject_seq(part_added, &mut sequence_number);
                                                                         yield Ok::<Bytes, String>(codex_sse_frame(&part_added));
 
-                                                                        reasoning_open = true;
-                                                                    }
+                                                                            reasoning_open = true;
+                                                                        }
 
-                                                                    accumulated_thinking.push_str(&clean_text);
+                                                                        accumulated_thinking.push_str(&clean_text);
                                                                     let delta_ev = json!({
                                                                         "type": "response.output_text.delta",
                                                                         "item_id": &active_reasoning_item_id,
@@ -740,6 +1036,7 @@ where
                                                                     });
                                                                     let delta_ev = inject_seq(delta_ev, &mut sequence_number);
                                                                     yield Ok::<Bytes, String>(codex_sse_frame(&delta_ev));
+                                                                    }
                                                                 } else {
                                                                     if !message_item_emitted {
                                                                         message_item_emitted = true;
@@ -996,10 +1293,19 @@ where
                                             }
                                         }
                                     }
-                                }
+                                    Ok(None) => {}
+                                    Err(parse_error) => {
+                                        tracing::error!("Responses stream framing error: {}", parse_error);
+                                        stream_failure = Some(parse_error);
+                                        break 'stream_loop;
+                                    }
                             }
                         }
-                        Some(Err(_)) => break,
+                        }
+                        Some(Err(error)) => {
+                            stream_failure = Some(format!("Gemini upstream stream error: {error}"));
+                            break;
+                        }
                         None => break,
                     }
                 }
@@ -1008,6 +1314,16 @@ where
                 }
             }
         }
+
+        // Only STOP is a successful Gemini terminal. Reasons such as
+        // MALFORMED_FUNCTION_CALL and OTHER are terminal, but not completion.
+        let terminal_item_status = if stream_failure.is_none()
+            && final_finish_reason.as_deref() == Some("STOP")
+        {
+            "completed"
+        } else {
+            "incomplete"
+        };
 
         // 最终收尾时，若可见思考 commentary 还开着，则先物化为完整 message。
         if reasoning_open {
@@ -1040,7 +1356,7 @@ where
                 "type": "message",
                 "role": "assistant",
                 "phase": "commentary",
-                "status": "completed",
+                "status": terminal_item_status,
                 "content": [{
                     "type": "output_text",
                     "text": &accumulated_thinking,
@@ -1106,7 +1422,7 @@ where
                 "type": "message",
                 "role": "assistant",
                 "phase": message_phase,
-                "status": "completed",
+                "status": terminal_item_status,
                 "content": [{
                     "type": "output_text",
                     "text": &accumulated_text,
@@ -1127,22 +1443,16 @@ where
 
         let final_outputs: Vec<serde_json::Value> = final_outputs_map.into_values().collect();
 
-        let missing_actionable_output = !message_item_emitted && !has_seen_tool_calls;
+        let prompt_blocked = final_finish_reason.as_deref() == Some("PROMPT_BLOCKED");
+        let hidden_thought_only_output = hide_thinking_output && !accumulated_thinking.is_empty();
+        let missing_actionable_output =
+            !message_item_emitted && !has_seen_tool_calls && !prompt_blocked && !hidden_thought_only_output;
         let terminal_status = if missing_actionable_output {
             "incomplete"
+        } else if stream_failure.is_none() && final_finish_reason.as_deref() == Some("STOP") {
+            "completed"
         } else {
-            match final_finish_reason.as_deref() {
-                Some("MAX_TOKENS")
-                | Some("SAFETY")
-                | Some("RECITATION")
-                | Some("BLOCKLIST")
-                | Some("PROHIBITED_CONTENT")
-                | Some("SPII")
-                | Some("IMAGE_SAFETY")
-                | Some("IMAGE_PROHIBITED_CONTENT")
-                | None => "incomplete",
-                _ => "completed",
-            }
+            "incomplete"
         };
         let terminal_type = format!("response.{terminal_status}");
         let incomplete_details = if terminal_status == "incomplete" {
@@ -1154,14 +1464,20 @@ where
                 | Some("PROHIBITED_CONTENT")
                 | Some("SPII")
                 | Some("IMAGE_SAFETY")
-                | Some("IMAGE_PROHIBITED_CONTENT") => "content_filter",
+                | Some("IMAGE_PROHIBITED_CONTENT")
+                | Some("PROMPT_BLOCKED") => "content_filter",
                 _ => "interrupted",
             };
             json!({"reason": reason})
         } else {
             Value::Null
         };
-        let terminal_error = if missing_actionable_output {
+        let terminal_error = if let Some(ref failure) = stream_failure {
+            json!({
+                "code": "upstream_malformed_stream",
+                "message": failure
+            })
+        } else if missing_actionable_output {
             json!({
                 "code": "empty_response",
                 "message": "Gemini stream ended without a final assistant message or tool call."
@@ -1198,18 +1514,22 @@ where
             if let Some(ref usage) = final_usage {
                 resp_obj.insert("usage".to_string(), usage.to_responses_usage_value());
             } else {
+                let output_tokens = estimate_stream_tokens(
+                    &format!("{}{}", accumulated_text, accumulated_thinking),
+                );
+                let input_tokens = fallback_input_tokens.unwrap_or(0);
                 resp_obj.insert(
                     "usage".to_string(),
                     json!({
-                        "input_tokens": 0,
+                        "input_tokens": input_tokens,
                         "input_tokens_details": {
                             "cached_tokens": 0
                         },
-                        "output_tokens": 0,
+                        "output_tokens": output_tokens,
                         "output_tokens_details": {
                             "reasoning_tokens": 0
                         },
-                        "total_tokens": 0
+                        "total_tokens": input_tokens.saturating_add(output_tokens)
                     }),
                 );
             }
@@ -1221,23 +1541,166 @@ where
     Box::pin(stream)
 }
 
+pub fn create_codex_sse_stream<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    assistant_turn_index: usize,
+    fallback_input_tokens: Option<u32>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_codex_sse_stream_with_options(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        assistant_turn_index,
+        fallback_input_tokens,
+        true,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::stream;
     use serde_json::json;
 
+    #[test]
+    fn gemini_sse_parser_rejects_corrupt_data_frames() {
+        let invalid_json = parse_gemini_sse_data_line(b"data: {\"candidates\": [}\n")
+            .expect_err("malformed JSON must not be ignored");
+        assert!(invalid_json.contains("Invalid JSON"));
+
+        let invalid_utf8 = parse_gemini_sse_data_line(b"data: \xff\n")
+            .expect_err("invalid UTF-8 must not be ignored");
+        assert!(invalid_utf8.contains("Invalid UTF-8"));
+
+        assert!(parse_gemini_sse_data_line(b": ping\n")
+            .expect("heartbeat")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_chat_stream_never_emits_done() {
+        let items: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            )),
+            Ok(Bytes::from("data: {\"candidates\":[}\n\n")),
+        ];
+        let mut output = create_openai_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "malformed-chat-test".to_string(),
+            1,
+            None,
+        );
+
+        let mut raw = String::new();
+        while let Some(item) = output.next().await {
+            raw.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+
+        assert!(raw.contains("upstream_malformed_stream"));
+        assert!(!raw.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn malformed_responses_stream_is_incomplete_even_after_stop() {
+        let items: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from(
+                "data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            )),
+            Ok(Bytes::from("data: {\"usageMetadata\":}\n\n")),
+        ];
+        let mut output = create_codex_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "malformed-responses-test".to_string(),
+            1,
+            0,
+            None,
+        );
+
+        let mut raw = String::new();
+        while let Some(item) = output.next().await {
+            raw.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+
+        assert!(raw.contains("event: response.incomplete"));
+        assert!(raw.contains("upstream_malformed_stream"));
+        assert!(!raw.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn streaming_usage_uses_total_to_include_separate_thoughts() {
+        let usage = extract_usage_metadata(&json!({
+            "promptTokenCount": 105,
+            "candidatesTokenCount": 179,
+            "thoughtsTokenCount": 237,
+            "totalTokenCount": 521
+        }))
+        .expect("usage");
+
+        assert_eq!(usage.prompt_tokens, 105);
+        assert_eq!(usage.completion_tokens, 416);
+        assert_eq!(usage.total_tokens, 521);
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            Some(237)
+        );
+    }
+
+    #[test]
+    fn streaming_usage_derives_thought_only_output_without_candidates() {
+        let usage = extract_usage_metadata(&json!({
+            "promptTokenCount": 105,
+            "thoughtsTokenCount": 125,
+            "totalTokenCount": 230
+        }))
+        .expect("usage");
+
+        assert_eq!(usage.completion_tokens, 125);
+        assert_eq!(usage.raw_output_tokens, Some(0));
+        assert_eq!(usage.total_tokens, 230);
+    }
+
+    #[test]
+    fn wrapped_stream_keeps_top_level_usage_metadata() {
+        let actual = unwrap_gemini_stream_value(json!({
+            "response": {
+                "candidates": [{"finishReason": "STOP"}]
+            },
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 8
+            }
+        }));
+
+        assert_eq!(actual["usageMetadata"]["totalTokenCount"], 8);
+    }
+
     async fn collect_codex_stream(chunks: Vec<Value>) -> (String, Vec<Value>) {
         let items: Vec<Result<Bytes, String>> = chunks
             .into_iter()
             .map(|chunk| Ok(Bytes::from(format!("data: {chunk}\n\n"))))
             .collect();
-        let mut stream = create_codex_sse_stream(
+        let mut stream = create_codex_sse_stream_with_options(
             Box::pin(stream::iter(items)),
             "gemini-pro-agent".to_string(),
             "test-codex-session".to_string(),
             0,
             0,
+            None,
+            false,
         );
 
         let mut raw = String::new();
@@ -1472,6 +1935,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_preserves_split_unterminated_terminal_frame() {
+        // Simulate reqwest splitting an SSE JSON object in the middle of a
+        // UTF-8 payload and closing the connection without a final newline.
+        let payload = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"tail survives\"}]}}]}}\n\n",
+            "data:{\"response\":{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[]}}]}}"
+        );
+        let bytes = payload.as_bytes();
+        let split_at = bytes.len() - 11;
+        let items = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&bytes[..split_at])),
+            Ok(Bytes::copy_from_slice(&bytes[split_at..])),
+        ];
+
+        let mut stream = create_codex_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-pro-agent".to_string(),
+            "split-session".to_string(),
+            0,
+            0,
+            None,
+        );
+        let mut body = String::new();
+        while let Some(item) = stream.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+
+        assert!(body.contains("tail survives"));
+        assert!(body.contains("response.completed"));
+        assert!(!body.contains("response.incomplete"));
+    }
+
+    #[tokio::test]
     async fn test_openai_streaming_usage_only_at_end() {
         // Chunk 1: Partial content, no usage
         let chunk1_json = json!({
@@ -1505,12 +2001,13 @@ mod tests {
 
         let gemini_stream = Box::pin(stream::iter(items));
 
-        let mut openai_stream = create_openai_sse_stream(
+        let mut openai_stream = create_openai_sse_stream_with_options(
             gemini_stream,
             "gemini-1.5-flash".to_string(),
             "test-session".to_string(),
             0,
             None,
+            false,
         );
 
         let mut chunks = Vec::new();
@@ -1579,12 +2076,13 @@ mod tests {
 
         let gemini_stream = Box::pin(stream::iter(items));
 
-        let mut openai_stream = create_openai_sse_stream(
+        let mut openai_stream = create_openai_sse_stream_with_options(
             gemini_stream,
             "gemini-1.5-flash".to_string(),
             "test-session".to_string(),
             0,
             None,
+            false,
         );
 
         let mut chunks = Vec::new();
@@ -1631,5 +2129,212 @@ mod tests {
 
         assert!(has_reasoning, "Should stream reasoning_content");
         assert!(has_content, "Should stream content");
+    }
+
+    #[tokio::test]
+    async fn data_prefix_without_space_is_not_dropped() {
+        let payload = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "kept"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 2,
+                "candidatesTokenCount": 1,
+                "totalTokenCount": 3
+            }
+        });
+        let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+            format!("data:{payload}\n\n"),
+        ))]);
+        let mut converted = create_openai_sse_stream(
+            Box::pin(stream),
+            "gemini-3-flash".to_string(),
+            "no-space-session".to_string(),
+            0,
+            None,
+        );
+        let mut body = String::new();
+        while let Some(item) = converted.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(body.contains("kept"));
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn chat_prompt_feedback_block_finishes_as_content_filter() {
+        let payload = json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 4, "totalTokenCount": 4 }
+        });
+        let stream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+            format!("data: {payload}\n\ndata: [DONE]\n\n"),
+        ))]);
+        let mut converted = create_openai_sse_stream(
+            Box::pin(stream),
+            "gemini-3-flash".to_string(),
+            "blocked-session".to_string(),
+            0,
+            None,
+        );
+        let mut body = String::new();
+        while let Some(item) = converted.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(body.contains("\"finish_reason\":\"content_filter\""));
+        assert!(body.contains("data: [DONE]"));
+        assert!(!body.contains("upstream_interrupted"));
+    }
+
+    #[tokio::test]
+    async fn chat_later_zero_usage_does_not_erase_real_counts() {
+        let chunks = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":7,\"totalTokenCount\":19}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":0,\"candidatesTokenCount\":0,\"totalTokenCount\":0}}\n\n",
+            )),
+        ];
+        let mut converted = create_openai_sse_stream(
+            Box::pin(stream::iter(chunks)),
+            "gemini-3-flash".to_string(),
+            "usage-session".to_string(),
+            0,
+            None,
+        );
+        let mut body = String::new();
+        while let Some(item) = converted.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(body.contains("\"prompt_tokens\":12"));
+        assert!(body.contains("\"completion_tokens\":7"));
+    }
+
+    #[tokio::test]
+    async fn responses_prompt_feedback_block_is_content_filter_incomplete() {
+        let (_, events) = collect_codex_stream(vec![json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 4, "totalTokenCount": 4 }
+        })])
+        .await;
+
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"]["reason"],
+            "content_filter"
+        );
+        assert!(terminal["response"]["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn responses_unknown_finish_reason_is_not_completed() {
+        let (_, events) = collect_codex_stream(vec![json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "partial" }] },
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        })])
+        .await;
+
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+    }
+
+    #[tokio::test]
+    async fn chat_thought_visibility_toggle_preserves_terminal_output() {
+        let payload = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "secret reasoning", "thought": true, "thoughtSignature": "sig-chat"},
+                    {"text": "visible answer"},
+                    {"functionCall": {"name": "lookup", "args": {"q": "x"}}, "thoughtSignature": "sig-tool"}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let input = Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"));
+
+        let mut hidden = create_openai_sse_stream_with_options(
+            Box::pin(stream::iter(vec![Ok::<Bytes, std::io::Error>(input.clone())])),
+            "gemini-3-flash".to_string(),
+            "hide-chat".to_string(),
+            0,
+            None,
+            true,
+        );
+        let mut hidden_body = String::new();
+        while let Some(item) = hidden.next().await {
+            hidden_body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(!hidden_body.contains("secret reasoning"));
+        assert!(hidden_body.contains("visible answer"));
+        assert!(hidden_body.contains("lookup"));
+        assert!(hidden_body.contains("data: [DONE]"));
+
+        let mut visible = create_openai_sse_stream_with_options(
+            Box::pin(stream::iter(vec![Ok::<Bytes, std::io::Error>(input)])),
+            "gemini-3-flash".to_string(),
+            "visible-chat".to_string(),
+            0,
+            None,
+            false,
+        );
+        let mut visible_body = String::new();
+        while let Some(item) = visible.next().await {
+            visible_body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(visible_body.contains("secret reasoning"));
+        assert!(visible_body.contains("visible answer"));
+    }
+
+    #[tokio::test]
+    async fn codex_thought_visibility_toggle_preserves_message() {
+        let payload = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "secret codex reasoning", "thought": true, "thoughtSignature": "sig-codex"},
+                    {"text": "codex answer"}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let input = Bytes::from(format!("data: {payload}\n\n"));
+
+        let mut hidden = create_codex_sse_stream_with_options(
+            Box::pin(stream::iter(vec![Ok::<Bytes, std::io::Error>(input.clone())])),
+            "gemini-3-flash".to_string(),
+            "hide-codex".to_string(),
+            0,
+            0,
+            Some(1),
+            true,
+        );
+        let mut hidden_body = String::new();
+        while let Some(item) = hidden.next().await {
+            hidden_body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(!hidden_body.contains("secret codex reasoning"));
+        assert!(hidden_body.contains("codex answer"));
+        assert!(hidden_body.contains("response.completed"));
+
+        let mut visible = create_codex_sse_stream_with_options(
+            Box::pin(stream::iter(vec![Ok::<Bytes, std::io::Error>(input)])),
+            "gemini-3-flash".to_string(),
+            "visible-codex".to_string(),
+            0,
+            0,
+            Some(1),
+            false,
+        );
+        let mut visible_body = String::new();
+        while let Some(item) = visible.next().await {
+            visible_body.push_str(&String::from_utf8_lossy(&item.expect("stream item")));
+        }
+        assert!(visible_body.contains("secret codex reasoning"));
+        assert!(visible_body.contains("codex answer"));
     }
 }

@@ -56,11 +56,15 @@ fn extract_apply_patch_input(args: &Value) -> String {
         .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default())
 }
 
-pub fn transform_openai_response(
+/// Convert a Gemini response to OpenAI format with an explicit thought-output
+/// policy. Thought signatures are cached before the policy is applied so tool
+/// continuations remain valid even when visible reasoning is hidden.
+pub fn transform_openai_response_with_options(
     gemini_response: &Value,
     session_id: Option<&str>,
     message_count: usize,
     client_tool_names: Option<&std::collections::HashSet<String>>,
+    hide_thinking_output: bool,
 ) -> OpenAIResponse {
     let empty_set = std::collections::HashSet::new();
     let client_tool_names = client_tool_names.unwrap_or(&empty_set);
@@ -103,10 +107,10 @@ pub fn transform_openai_response(
 
                     // 文本部分
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        if is_thought_part {
+                        if is_thought_part && !hide_thinking_output {
                             // thought: true 时，text 是思考内容
                             thought_out.push_str(text);
-                        } else {
+                        } else if !is_thought_part {
                             // 正常内容
                             content_out.push_str(text);
                         }
@@ -286,15 +290,16 @@ pub fn transform_openai_response(
                 .get("finishReason")
                 .and_then(|f| f.as_str())
                 .map(|f| match f {
-                    "STOP" => "stop",
-                    "MAX_TOKENS" => "length",
-                    "SAFETY" => "content_filter",
-                    "RECITATION" => "content_filter",
-                    _ => "stop",
-                })
-                .unwrap_or("stop");
+                    "STOP" => "stop".to_string(),
+                    "MAX_TOKENS" => "length".to_string(),
+                    "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT"
+                    | "SPII" | "IMAGE_SAFETY" | "IMAGE_PROHIBITED_CONTENT" => {
+                        "content_filter".to_string()
+                    }
+                    other => other.to_ascii_lowercase(),
+                });
 
-            let refusal_val = if finish_reason == "content_filter" {
+            let refusal_val = if finish_reason.as_deref() == Some("content_filter") {
                 Some("生成由于安全策略或背诵保护被中止".to_string())
             } else {
                 None
@@ -323,7 +328,7 @@ pub fn transform_openai_response(
                     name: None,
                     refusal: refusal_val,
                 },
-                finish_reason: Some(finish_reason.to_string()),
+                finish_reason,
             });
         }
     }
@@ -355,73 +360,9 @@ pub fn transform_openai_response(
     // Extract and map usage metadata from Gemini to OpenAI format
     // Supports both legacy v1internal format (promptTokenCount/candidatesTokenCount/totalTokenCount/cachedContentTokenCount)
     // and new Interactions API format (total_input_tokens/total_output_tokens/total_thought_tokens/total_cached_tokens)
-    let usage = raw.get("usageMetadata").and_then(|u| {
-        // 优先使用新格式字段，fallback 到旧格式
-        let prompt_tokens = u
-            .get("total_input_tokens")
-            .or_else(|| u.get("promptTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let raw_output_tokens = u
-            .get("total_output_tokens")
-            .or_else(|| u.get("candidatesTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let raw_total_tokens = u
-            .get("total_tokens")
-            .or_else(|| u.get("totalTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let cached_tokens = u
-            .get("total_cached_tokens")
-            .or_else(|| u.get("cachedContentTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        // [NEW] 从新格式提取 reasoning/thought tokens
-        let reasoning_tokens = u
-            .get("total_thought_tokens")
-            .or_else(|| u.get("totalThoughtTokens"))
-            .or_else(|| u.get("thoughtsTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let tool_use_tokens = u
-            .get("total_tool_use_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
-
-        // New Interactions usage keeps thought/tool-use tokens separate from
-        // total_output_tokens. Legacy candidatesTokenCount already includes those.
-        let has_new_format = u.get("total_output_tokens").is_some();
-        let completion_tokens = if has_new_format {
-            raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
-        } else {
-            raw_output_tokens
-        };
-
-        // Keep prompt_tokens as Gemini's raw input token count. cached_tokens is a
-        // subset of the prompt, not an amount to subtract from it.
-        let final_total_tokens = raw_total_tokens.unwrap_or(prompt_tokens + completion_tokens);
-
-        Some(super::models::OpenAIUsage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: final_total_tokens,
-            prompt_tokens_details: cached_tokens.map(|ct| super::models::PromptTokensDetails {
-                cached_tokens: Some(ct),
-            }),
-            completion_tokens_details: reasoning_tokens.map(|rt| {
-                super::models::CompletionTokensDetails {
-                    reasoning_tokens: Some(rt),
-                }
-            }),
-            input_tokens_by_modality,
-            raw_output_tokens: Some(raw_output_tokens),
-            total_thought_tokens: reasoning_tokens,
-            total_tool_use_tokens: tool_use_tokens,
-            gemini_total_tokens: raw_total_tokens,
-        })
-    });
+    let usage = raw
+        .get("usageMetadata")
+        .map(super::models::OpenAIUsage::from_gemini_metadata);
 
     OpenAIResponse {
         id: raw
@@ -439,6 +380,24 @@ pub fn transform_openai_response(
         choices,
         usage,
     }
+}
+
+/// Backward-compatible conversion entry point. Production clients historically
+/// hide visible reasoning by default; callers that need to expose it should use
+/// [`transform_openai_response_with_options`] with `false`.
+pub fn transform_openai_response(
+    gemini_response: &Value,
+    session_id: Option<&str>,
+    message_count: usize,
+    client_tool_names: Option<&std::collections::HashSet<String>>,
+) -> OpenAIResponse {
+    transform_openai_response_with_options(
+        gemini_response,
+        session_id,
+        message_count,
+        client_tool_names,
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -549,6 +508,73 @@ mod tests {
     }
 
     #[test]
+    fn compat_regression_legacy_usage_includes_hidden_thought_tokens() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "Short answer"}]},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 125,
+                "candidatesTokenCount": 10,
+                "thoughtsTokenCount": 286,
+                "totalTokenCount": 421
+            },
+            "modelVersion": "gemini-3-flash",
+            "responseId": "resp_thoughts"
+        });
+
+        let result = transform_openai_response(&gemini_resp, None, 1, None);
+        let usage = result.usage.unwrap();
+
+        assert_eq!(usage.prompt_tokens, 125);
+        assert_eq!(usage.completion_tokens, 296);
+        assert_eq!(usage.total_tokens, 421);
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+            Some(286)
+        );
+
+        let responses_usage = usage.to_responses_usage_value();
+        assert_eq!(responses_usage["input_tokens"], 125);
+        assert_eq!(responses_usage["output_tokens"], 296);
+        assert_eq!(
+            responses_usage["output_tokens_details"]["reasoning_tokens"],
+            286
+        );
+        assert_eq!(responses_usage["total_tokens"], 421);
+    }
+
+    #[test]
+    fn compat_regression_legacy_thought_only_usage_is_preserved() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {"parts": []},
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 125,
+                "thoughtsTokenCount": 286,
+                "totalTokenCount": 411
+            }
+        });
+
+        let result = transform_openai_response(&gemini_resp, None, 1, None);
+        let usage = result.usage.unwrap();
+
+        assert_eq!(usage.prompt_tokens, 125);
+        assert_eq!(usage.completion_tokens, 286);
+        assert_eq!(usage.total_tokens, 411);
+        assert_eq!(
+            usage.to_responses_usage_value()["output_tokens_details"]["reasoning_tokens"],
+            286
+        );
+    }
+
+    #[test]
     fn test_response_without_usage_metadata() {
         let gemini_resp = json!({
             "candidates": [{
@@ -561,5 +587,36 @@ mod tests {
 
         let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn thought_visibility_is_configurable_without_losing_tools_or_signatures() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "internal", "thought": true, "thoughtSignature": "sig-1"},
+                    {"text": "answer"},
+                    {"functionCall": {"name": "lookup", "args": {"q": "x"}}, "thoughtSignature": "sig-2"}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}
+        });
+
+        let hidden = transform_openai_response_with_options(&gemini_resp, None, 1, None, true);
+        let hidden_message = &hidden.choices[0].message;
+        assert!(hidden_message.reasoning_content.is_none());
+        assert!(hidden_message.content.as_ref().is_some_and(|content| {
+            matches!(content, OpenAIContent::String(text) if text == "answer")
+        }));
+        assert_eq!(hidden_message.tool_calls.as_ref().map(Vec::len), Some(1));
+        assert!(hidden.usage.is_some());
+
+        let visible = transform_openai_response_with_options(&gemini_resp, None, 1, None, false);
+        assert_eq!(
+            visible.choices[0].message.reasoning_content.as_deref(),
+            Some("internal")
+        );
+        assert_eq!(visible.choices[0].message.tool_calls.as_ref().map(Vec::len), Some(1));
     }
 }

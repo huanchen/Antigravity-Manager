@@ -114,6 +114,76 @@ pub struct AppState {
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
 }
 
+/// Return whether a saved configuration changes the inputs used by quota
+/// protection.  The account loader reads these values from the persisted
+/// application config, so changing any of them requires rebuilding the in-memory
+/// account pool before the next request is dispatched.
+pub fn quota_protection_config_changed(
+    previous: Option<&AppConfig>,
+    next: &AppConfig,
+) -> bool {
+    let Some(previous) = previous else {
+        // If the previous config could not be read, reload conservatively.  The
+        // config has already been persisted by the caller and a reload is safe.
+        return true;
+    };
+
+    previous.quota_protection.enabled != next.quota_protection.enabled
+        || previous.quota_protection.threshold_percentage
+            != next.quota_protection.threshold_percentage
+        || previous.quota_protection.monitored_models
+            != next.quota_protection.monitored_models
+}
+
+/// Apply the portions of `AppConfig` cached by `TokenManager` at runtime.
+///
+/// Both the desktop command and the web/headless admin endpoint must use the
+/// same path.  In particular, quota-protection changes alter which account
+/// files are eligible; merely updating the persisted JSON leaves stale tokens
+/// and sticky-session bindings in memory.
+pub async fn apply_token_manager_runtime_config(
+    token_manager: &TokenManager,
+    previous: Option<&AppConfig>,
+    next: &AppConfig,
+) -> Result<(), String> {
+    token_manager
+        .update_sticky_config(next.proxy.scheduling.clone())
+        .await;
+    token_manager
+        .set_preferred_account(next.proxy.preferred_account_id.clone())
+        .await;
+    token_manager
+        .update_circuit_breaker_config(next.circuit_breaker.clone())
+        .await;
+
+    if quota_protection_config_changed(previous, next) {
+        // A protected account may have been selected by an existing sticky
+        // session.  Drop those bindings before rebuilding the pool so the next
+        // request cannot continue using stale eligibility information.
+        token_manager.clear_all_sessions();
+        match token_manager.reload_all_accounts().await {
+            Ok(count) => tracing::info!(
+                "Quota protection configuration hot-reloaded; {} account(s) available",
+                count
+            ),
+            Err(error) if token_manager.len() == 0 => {
+                // A fresh installation may not have an accounts directory yet.
+                // There is no in-memory state to invalidate in that case, so a
+                // config save should still succeed.
+                tracing::debug!(
+                    "Skipping quota account reload because no accounts are configured: {}",
+                    error
+                );
+            }
+            Err(error) => {
+                return Err(format!("重新加载配额保护账号状态失败: {}", error));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // 为 AppState 实现 FromRef，以便中间件提取 security 状态
 impl axum::extract::FromRef<AppState> for Arc<RwLock<crate::proxy::ProxySecurityConfig>> {
     fn from_ref(state: &AppState) -> Self {
@@ -1419,6 +1489,10 @@ async fn admin_save_config(
     State(state): State<AppState>,
     Json(payload): Json<SaveConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    // Read the previous values before persisting.  Quota protection is applied
+    // while account files are loaded, so a later comparison with the already
+    // saved config would always miss the change.
+    let previous_config = config::load_app_config().ok();
     let new_config = payload.config;
     // 1. 持久化
     config::save_app_config(&new_config).map_err(|e| {
@@ -1471,6 +1545,61 @@ async fn admin_save_config(
         let mut pool = state.proxy_pool_state.write().await;
         *pool = new_config.clone().proxy.proxy_pool;
     }
+
+    // Keep the Web/headless path equivalent to the desktop AxumServer update
+    // methods.  Updating the config locks alone does not rebuild the default
+    // HTTP client or refresh the proxy-pool binding/client caches.
+    state
+        .upstream
+        .rebuild_default_client(Some(new_config.proxy.upstream_proxy.clone()))
+        .await;
+    state.proxy_pool_manager.sync_bindings_from_config().await;
+    state.upstream.clear_client_cache();
+
+    {
+        let mut debug_logging = state.debug_logging.write().await;
+        *debug_logging = new_config.proxy.debug_logging.clone();
+    }
+    state.monitor.set_enabled(new_config.proxy.enable_logging);
+    state
+        .upstream
+        .set_user_agent_override(new_config.proxy.user_agent_override.clone())
+        .await;
+
+    // These values are read from process-wide config stores by request
+    // mappers, so they must be refreshed even when the admin API is used
+    // without the desktop command path.
+    crate::proxy::update_thinking_budget_config(new_config.proxy.thinking_budget.clone());
+    crate::proxy::update_global_system_prompt_config(
+        new_config.proxy.global_system_prompt.clone(),
+    );
+    crate::proxy::update_image_thinking_mode(new_config.proxy.image_thinking_mode.clone());
+    crate::proxy::config::update_global_compression_level(
+        new_config.proxy.experimental.compression_level.clone(),
+        new_config.proxy.experimental.enable_usage_scaling,
+    );
+    crate::proxy::config::update_global_thresholds(
+        new_config.proxy.experimental.context_compression_threshold_l1,
+        new_config.proxy.experimental.context_compression_threshold_l2,
+        new_config.proxy.experimental.context_compression_threshold_l3,
+    );
+
+    // Keep the scheduler and account eligibility state in sync with the
+    // persisted configuration.  This is intentionally shared with the
+    // desktop save command so web/headless mode cannot retain stale P2C,
+    // preferred-account, circuit-breaker, or quota-protection state.
+    crate::proxy::server::apply_token_manager_runtime_config(
+        state.token_manager.as_ref(),
+        previous_config.as_ref(),
+        &new_config,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
 
     Ok(StatusCode::OK)
 }
@@ -1693,12 +1822,30 @@ struct SetPreferredAccountRequest {
 async fn admin_set_preferred_account(
     State(state): State<AppState>,
     Json(payload): Json<SetPreferredAccountRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let preferred_id = payload.account_id.filter(|id| !id.trim().is_empty());
+
+    // Keep Web/Headless behavior aligned with the Tauri command: fixed-account
+    // mode must survive a container restart.
+    let mut app_config = config::load_app_config().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error }),
+        )
+    })?;
+    app_config.proxy.preferred_account_id = preferred_id.clone();
+    config::save_app_config(&app_config).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error }),
+        )
+    })?;
+
     state
         .token_manager
-        .set_preferred_account(payload.account_id)
+        .set_preferred_account(preferred_id)
         .await;
-    StatusCode::OK
+    Ok(StatusCode::OK)
 }
 
 async fn admin_fetch_zai_models(
@@ -3843,6 +3990,71 @@ async fn admin_execute_droid_restore(
                 Json(ErrorResponse { error: e }),
             )
         })
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::{apply_token_manager_runtime_config, quota_protection_config_changed, AppConfig};
+    use crate::proxy::TokenManager;
+
+    #[test]
+    fn quota_protection_change_detection_covers_all_runtime_inputs() {
+        let previous = AppConfig::new();
+        assert!(!quota_protection_config_changed(
+            Some(&previous),
+            &previous
+        ));
+
+        let mut unrelated = previous.clone();
+        unrelated.proxy.port += 1;
+        assert!(!quota_protection_config_changed(
+            Some(&previous),
+            &unrelated
+        ));
+
+        let mut changed = previous.clone();
+        changed.quota_protection.enabled = !changed.quota_protection.enabled;
+        assert!(quota_protection_config_changed(Some(&previous), &changed));
+
+        let mut changed = previous.clone();
+        changed.quota_protection.threshold_percentage += 1;
+        assert!(quota_protection_config_changed(Some(&previous), &changed));
+
+        let mut changed = previous.clone();
+        changed.quota_protection.monitored_models.push("custom-model".into());
+        assert!(quota_protection_config_changed(Some(&previous), &changed));
+    }
+
+    #[test]
+    fn missing_previous_config_triggers_conservative_reload() {
+        assert!(quota_protection_config_changed(None, &AppConfig::new()));
+    }
+
+    #[tokio::test]
+    async fn runtime_update_refreshes_scheduler_preferred_and_circuit_breaker() {
+        let token_manager = TokenManager::new(std::env::temp_dir().join(format!(
+            "antigravity-runtime-config-{}",
+            uuid::Uuid::new_v4()
+        )));
+        let mut config = AppConfig::new();
+        config.proxy.scheduling.max_wait_seconds = 7;
+        config.proxy.preferred_account_id = Some("preferred-account".to_string());
+        config.circuit_breaker.enabled = false;
+
+        apply_token_manager_runtime_config(&token_manager, Some(&config), &config)
+            .await
+            .expect("runtime config update should succeed without an account reload");
+
+        assert_eq!(
+            token_manager.get_sticky_config().await.max_wait_seconds,
+            7
+        );
+        assert_eq!(
+            token_manager.get_preferred_account().await.as_deref(),
+            Some("preferred-account")
+        );
+        assert!(!token_manager.get_circuit_breaker_config().await.enabled);
+    }
 }
 
 async fn admin_get_droid_config_content(

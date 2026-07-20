@@ -2,7 +2,7 @@
 // 用于非 Stream 请求的自动转换
 
 use super::models::*;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::io;
@@ -25,6 +25,86 @@ fn parse_sse_line(line: &str) -> Option<(String, String)> {
     }
 }
 
+fn collect_sse_line(
+    line: &str,
+    current_event_type: &mut String,
+    current_data: &mut String,
+    events: &mut Vec<SseEvent>,
+) -> Result<(), String> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line.is_empty() {
+        if !current_data.is_empty() {
+            if current_data.trim() == "[DONE]" {
+                events.push(SseEvent {
+                    event_type: "__done".to_string(),
+                    data: Value::Null,
+                });
+            } else {
+                let data = serde_json::from_str::<Value>(&current_data)
+                    .map_err(|error| format!("Invalid Claude SSE JSON: {error}"))?;
+                events.push(SseEvent {
+                    event_type: current_event_type.clone(),
+                    data,
+                });
+            }
+            current_event_type.clear();
+            current_data.clear();
+        }
+        return Ok(());
+    }
+
+    if let Some((key, value)) = parse_sse_line(line) {
+        match key.as_str() {
+            "event" => *current_event_type = value,
+            "data" => {
+                if !current_data.is_empty() {
+                    current_data.push('\n');
+                }
+                current_data.push_str(&value);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn merge_partial_usage(target: &mut Usage, value: &Value) {
+    fn merge_u32(slot: &mut u32, value: Option<u64>) {
+        if let Some(value) = value.and_then(|value| u32::try_from(value).ok()) {
+            *slot = (*slot).max(value);
+        }
+    }
+    fn merge_optional(slot: &mut Option<u32>, value: Option<u64>) {
+        if let Some(value) = value.and_then(|value| u32::try_from(value).ok()) {
+            *slot = Some(slot.unwrap_or(0).max(value));
+        }
+    }
+
+    merge_u32(
+        &mut target.input_tokens,
+        value.get("input_tokens").and_then(Value::as_u64),
+    );
+    merge_u32(
+        &mut target.output_tokens,
+        value.get("output_tokens").and_then(Value::as_u64),
+    );
+    merge_optional(
+        &mut target.cache_read_input_tokens,
+        value
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64),
+    );
+    merge_optional(
+        &mut target.cache_creation_input_tokens,
+        value
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+    );
+    if target.server_tool_use.is_none() {
+        target.server_tool_use = value.get("server_tool_use").cloned();
+    }
+}
+
 /// 将 SSE Stream 收集为完整的 Claude Response
 ///
 /// 此函数接收一个 SSE 字节流，解析所有事件，并重建完整的 ClaudeResponse 对象。
@@ -36,34 +116,42 @@ where
     let mut events = Vec::new();
     let mut current_event_type = String::new();
     let mut current_data = String::new();
+    let mut buffer = BytesMut::new();
 
     // 1. 收集所有 SSE 事件
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream error: {}", e))?;
-        let text = String::from_utf8_lossy(&chunk);
-
-        for line in text.lines() {
-            if line.is_empty() {
-                // 空行表示事件结束
-                if !current_data.is_empty() {
-                    if let Ok(data) = serde_json::from_str::<Value>(&current_data) {
-                        events.push(SseEvent {
-                            event_type: current_event_type.clone(),
-                            data,
-                        });
-                    }
-                    current_event_type.clear();
-                    current_data.clear();
-                }
-            } else if let Some((key, value)) = parse_sse_line(line) {
-                match key.as_str() {
-                    "event" => current_event_type = value,
-                    "data" => current_data = value,
-                    _ => {}
-                }
-            }
+        buffer.extend_from_slice(&chunk);
+        while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+            let line = buffer.split_to(position + 1);
+            let line = std::str::from_utf8(&line)
+                .map_err(|error| format!("Invalid UTF-8 in Claude SSE stream: {error}"))?;
+            collect_sse_line(
+                line,
+                &mut current_event_type,
+                &mut current_data,
+                &mut events,
+            )?;
         }
     }
+
+    if !buffer.is_empty() {
+        let line = std::str::from_utf8(&buffer)
+            .map_err(|error| format!("Invalid UTF-8 in Claude SSE stream: {error}"))?;
+        collect_sse_line(
+            line,
+            &mut current_event_type,
+            &mut current_data,
+            &mut events,
+        )?;
+    }
+    // Flush a final event that had no blank line terminator.
+    collect_sse_line(
+        "",
+        &mut current_event_type,
+        &mut current_data,
+        &mut events,
+    )?;
 
     // 2. 重建 ClaudeResponse
     let mut response = ClaudeResponse {
@@ -72,7 +160,7 @@ where
         role: "assistant".to_string(),
         model: String::new(),
         content: Vec::new(),
-        stop_reason: "end_turn".to_string(),
+        stop_reason: String::new(),
         stop_sequence: None,
         usage: Usage {
             input_tokens: 0,
@@ -89,6 +177,7 @@ where
     let mut current_signature: Option<String> = None;
     let mut current_tool_use: Option<Value> = None;
     let mut current_tool_input = String::new();
+    let mut saw_message_stop = false;
 
     for event in events {
         match event.event_type.as_str() {
@@ -102,9 +191,7 @@ where
                         response.model = model.to_string();
                     }
                     if let Some(usage) = message.get("usage") {
-                        if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-                            response.usage = u;
-                        }
+                        merge_partial_usage(&mut response.usage, usage);
                     }
                 }
             }
@@ -215,16 +302,17 @@ where
                     }
                 }
                 if let Some(usage) = event.data.get("usage") {
-                    if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-                        response.usage = u;
-                    }
+                    merge_partial_usage(&mut response.usage, usage);
                 }
             }
 
             "message_stop" => {
-                // Stream 结束
-                break;
+                // Mark protocol completion, but keep consuming framing/usage-only
+                // events that may follow in the same transport stream.
+                saw_message_stop = true;
             }
+
+            "__done" => {}
 
             "error" => {
                 // 错误事件
@@ -240,6 +328,19 @@ where
                 // 忽略未知事件类型
             }
         }
+    }
+
+    if !saw_message_stop {
+        return Err(
+            "Claude stream ended without message_stop; refusing to return a partial response"
+                .to_string(),
+        );
+    }
+    if response.stop_reason.is_empty() {
+        return Err(
+            "Claude stream ended without stop_reason; refusing to return a partial response"
+                .to_string(),
+        );
     }
 
     Ok(response)
@@ -276,6 +377,8 @@ mod tests {
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.model, "claude-3-5-sonnet");
         assert_eq!(response.content.len(), 1);
+        assert_eq!(response.usage.input_tokens, 10);
+        assert_eq!(response.usage.output_tokens, 5);
 
         if let ContentBlock::Text { text } = &response.content[0] {
             assert_eq!(text, "Hello World");
@@ -321,5 +424,34 @@ mod tests {
         } else {
             panic!("Expected Thinking block");
         }
+    }
+
+    #[tokio::test]
+    async fn abrupt_eof_is_not_returned_as_end_turn() {
+        let partial = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"model\":\"test\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        ];
+        let stream = stream::iter(
+            partial
+                .into_iter()
+                .map(|item| Ok::<Bytes, io::Error>(Bytes::from(item))),
+        );
+        let error = collect_stream_to_json(stream)
+            .await
+            .expect_err("missing message_stop must fail");
+        assert!(error.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn standard_error_event_fails_collection() {
+        let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n\n",
+        ))]);
+        let error = collect_stream_to_json(stream)
+            .await
+            .expect_err("error event must fail");
+        assert!(error.contains("boom"));
     }
 }

@@ -39,6 +39,7 @@ RUN which go && go version || (echo "ERROR: Go compiler not found" && exit 1)
 
 # Use Aliyun mirror for Cargo if needed (Sparse Index)
 ENV CARGO_HTTP_MULTIPLEXING=false
+ENV CARGO_BUILD_JOBS=1
 RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
     echo "Using Aliyun mirror for Cargo..."; \
     mkdir -p /root/.cargo && \

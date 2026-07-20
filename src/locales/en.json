@@ -814,6 +814,10 @@
       "experimental": {
         "title": "Experimental Settings",
         "title_tooltip": "Exploratory features that may be adjusted or removed in future versions.",
+        "hide_thinking_output": "Hide Thinking Output",
+        "hide_thinking_output_tooltip": "Hides visible reasoning text while preserving signatures, tool calls, usage, and terminal status.",
+        "direct_non_stream": "Direct Non-stream Requests",
+        "direct_non_stream_tooltip": "Use the upstream non-streaming endpoint for stream=false requests. Disabled by default while stream validation remains enabled.",
         "enable_usage_scaling": "Enable Usage Scaling",
         "enable_usage_scaling_tooltip": "For all compatible protocols (Claude/OpenAI/Gemini). Enables aggressive scaling and multi-phase context compression when total input exceeds 30k tokens. Note: Reported usage will not reflect actual billing after enabling.",
         "compression_level_label": "Context Compression Level",

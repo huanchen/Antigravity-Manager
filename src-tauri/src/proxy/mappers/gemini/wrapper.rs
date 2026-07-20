@@ -2,6 +2,108 @@
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
 
+const ALLOWED_SAFETY_CATEGORIES: &[&str] = &[
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+    "HARM_CATEGORY_JAILBREAK",
+];
+
+const ALLOWED_SAFETY_THRESHOLDS: &[&str] = &[
+    "OFF",
+    "BLOCK_NONE",
+    "BLOCK_LOW_AND_ABOVE",
+    "BLOCK_MEDIUM_AND_ABOVE",
+    "BLOCK_ONLY_HIGH",
+    "HARM_BLOCK_THRESHOLD_UNSPECIFIED",
+];
+
+fn normalize_safety_enum(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn clean_generation_response_schema(inner_request: &mut Value) {
+    let Some(request) = inner_request.as_object_mut() else {
+        return;
+    };
+
+    if let Some(generation_config) = request.remove("generation_config") {
+        request
+            .entry("generationConfig".to_string())
+            .or_insert(generation_config);
+    }
+
+    let Some(generation_config) = inner_request
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    if let Some(mut schema) = generation_config.remove("response_schema") {
+        crate::proxy::common::json_schema::clean_json_schema(&mut schema);
+        generation_config
+            .entry("responseSchema".to_string())
+            .or_insert(schema);
+    }
+    if let Some(schema) = generation_config.get_mut("responseSchema") {
+        crate::proxy::common::json_schema::clean_json_schema(schema);
+    }
+}
+
+fn clean_safety_settings(inner_request: &mut Value) {
+    let Some(request) = inner_request.as_object_mut() else {
+        return;
+    };
+
+    let settings = if let Some(value) = request.remove("safetySettings") {
+        request.remove("safety_settings");
+        value
+    } else if let Some(value) = request.remove("safety_settings") {
+        value
+    } else {
+        return;
+    };
+
+    let Value::Array(settings) = settings else {
+        return;
+    };
+
+    let mut cleaned = Vec::new();
+    let mut seen_categories = std::collections::HashSet::new();
+    for setting in settings {
+        let Value::Object(mut setting) = setting else {
+            continue;
+        };
+        let Some(category) = setting.get("category").and_then(normalize_safety_enum) else {
+            continue;
+        };
+        if !ALLOWED_SAFETY_CATEGORIES.contains(&category.as_str())
+            || !seen_categories.insert(category.clone())
+        {
+            continue;
+        }
+
+        let threshold = setting
+            .get("threshold")
+            .and_then(normalize_safety_enum)
+            .filter(|value| ALLOWED_SAFETY_THRESHOLDS.contains(&value.as_str()))
+            .unwrap_or_else(|| "OFF".to_string());
+        setting.insert("category".to_string(), json!(category));
+        setting.insert("threshold".to_string(), json!(threshold));
+        cleaned.push(Value::Object(setting));
+    }
+
+    if !cleaned.is_empty() {
+        request.insert("safetySettings".to_string(), Value::Array(cleaned));
+    }
+}
+
 /// 包装请求体为 v1internal 格式
 pub fn wrap_request_v2(
     body: &Value,
@@ -37,6 +139,13 @@ pub fn wrap_request_v2(
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
+
+    // Gemini accepts only its API Schema subset and camelCase request keys.
+    // Normalize OpenAI-style response schemas before the v1internal call.
+    clean_generation_response_schema(&mut inner_request);
+
+    // v1internal validates safety enums strictly and rejects legacy categories.
+    clean_safety_settings(&mut inner_request);
 
     // [FIX #1522] Inject dummy IDs for Claude models in Gemini protocol
     let is_target_claude = final_model_name.to_lowercase().contains("claude");
@@ -490,22 +599,20 @@ pub fn wrap_request_v2(
                 .get("thinkingBudget")
                 .and_then(|v| v.as_i64());
 
-            // For adaptive or dynamic mode, we only need to ensure max tokens is large.
-            // For fixed budget, we must satisfy maxOutputTokens > thinkingBudget.
             let current_max = gen_config
                 .get("maxOutputTokens")
                 .and_then(|v| v.as_u64())
                 .or(req_max_tokens);
 
             if is_adaptive {
-                if current_max.map_or(true, |m| m < 131072) {
+                if current_max.is_none() {
                     gen_config.insert("maxOutputTokens".to_string(), json!(131072));
                 }
             } else if let Some(budget_i64) = budget_opt {
                 if budget_i64 > 0 {
                     let budget = budget_i64 as u64;
                     let min_required_max = budget + 8192;
-                    if current_max.map_or(true, |m| m <= budget) {
+                    if current_max.unwrap_or(0) <= budget {
                         tracing::info!(
                             "[Gemini-Wrap] Bumping maxOutputTokens from {:?} to {} to satisfy thinkingBudget ({})",
                             current_max, min_required_max, budget
@@ -537,6 +644,29 @@ pub fn wrap_request_v2(
                     final_model_name
                 );
                 gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_cap));
+            }
+        }
+
+        // Keep the thinking budget strictly below the final native cap after
+        // dynamic/static limit enforcement. This is especially important when
+        // an account advertises a smaller valid limit than the model default.
+        let final_max = gen_config
+            .get("maxOutputTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(final_cap);
+        if let Some(thinking) = gen_config
+            .get_mut("thinkingConfig")
+            .and_then(Value::as_object_mut)
+        {
+            let budget = thinking
+                .get("thinkingBudget")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if budget >= final_max && final_max > 0 {
+                thinking.insert(
+                    "thinkingBudget".to_string(),
+                    json!(final_max.saturating_sub(1).max(1)),
+                );
             }
         }
     }
@@ -661,6 +791,11 @@ pub fn wrap_request_v2(
                         }
                     }
                 }
+            }
+            if let Some(contents) = obj.get_mut("contents") {
+                crate::proxy::mappers::common_utils::force_image_generation_prompts_in_contents(
+                    contents,
+                );
             }
 
             // 3. Clean generationConfig (remove responseMimeType, responseModalities etc.)
@@ -1239,6 +1374,110 @@ mod tests {
     }
 
     #[test]
+    fn compat_regression_cleans_native_response_schema() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Return JSON"}]}],
+            "generationConfig": {
+                "responseSchema": {
+                    "type": "object",
+                    "$defs": {"Item": {"type": "object", "properties": {"kind": {"const": "ok"}}}},
+                    "properties": {"item": {"$ref": "#/$defs/Item"}}
+                }
+            }
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let schema = &result["request"]["generationConfig"]["responseSchema"];
+        let serialized = serde_json::to_string(schema).unwrap();
+        assert!(!serialized.contains("\"$defs\""));
+        assert!(!serialized.contains("\"$ref\""));
+        assert!(!serialized.contains("\"const\""));
+    }
+
+    #[test]
+    fn compat_regression_normalizes_snake_case_response_schema() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Return JSON"}]}],
+            "generation_config": {
+                "response_schema": {"type": "object", "properties": {"status": {"const": "ok"}}}
+            }
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let request = &result["request"];
+        assert!(request.get("generation_config").is_none());
+        assert!(request["generationConfig"].get("response_schema").is_none());
+        assert!(request["generationConfig"].get("responseSchema").is_some());
+    }
+
+    #[test]
+    fn compat_regression_wrap_request_cleans_safety_settings() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "safety_settings": [
+                { "category": "harm_category_harassment", "threshold": "off" },
+                { "category": "HARM_CATEGORY_DEROGATORY", "threshold": "OFF" },
+                { "category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "invalid" },
+                { "category": "HARM_CATEGORY_JAILBREAK", "threshold": "OFF" },
+                { "category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE" }
+            ]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let request = &result["request"];
+        let settings = request["safetySettings"].as_array().unwrap();
+
+        assert!(request.get("safety_settings").is_none());
+        assert_eq!(settings.len(), 3);
+        assert_eq!(settings[0]["category"], "HARM_CATEGORY_HARASSMENT");
+        assert_eq!(settings[0]["threshold"], "OFF");
+        assert_eq!(settings[1]["category"], "HARM_CATEGORY_CIVIC_INTEGRITY");
+        assert_eq!(settings[1]["threshold"], "OFF");
+        assert_eq!(settings[2]["category"], "HARM_CATEGORY_JAILBREAK");
+        assert_eq!(settings[2]["threshold"], "OFF");
+    }
+
+    #[test]
+    fn compat_regression_wrap_request_cleans_tool_schema_shapes() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "schedule",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "bymonth": { "type": "ARRAY" },
+                            "byday": { "type": "ARRAY", "properties": {} }
+                        }
+                    }
+                }]
+            }]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let parameters = &result["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+
+        assert_eq!(parameters["properties"]["bymonth"]["type"], "array");
+        assert_eq!(
+            parameters["properties"]["bymonth"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(parameters["properties"]["byday"]["type"], "array");
+        assert!(parameters["properties"]["byday"]
+            .get("properties")
+            .is_none());
+        assert_eq!(
+            parameters["properties"]["byday"]["items"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn test_unwrap_response() {
         let wrapped = json!({
             "response": {
@@ -1332,6 +1571,28 @@ mod tests {
             .unwrap();
         // [FIX #1592] Pro models now also capped to 24576 in wrap_request logic
         assert_eq!(budget_pro, 24576);
+    }
+
+    #[test]
+    fn explicit_small_native_max_reserves_visible_output_for_thinking() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "generationConfig": {
+                "maxOutputTokens": 128,
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": 32000
+                }
+            }
+        });
+
+        let result = wrap_request(&body, "test-proj", "gemini-2.5-flash", None, None, None);
+        let generation = &result["request"]["generationConfig"];
+        // v4.4.6 advertises a 32768 thinking ceiling for Gemini 2.5 Flash.
+        // Preserve the valid client budget and reserve 8192 visible tokens.
+        assert_eq!(generation["maxOutputTokens"], 40192);
+        assert_eq!(generation["thinkingConfig"]["thinkingBudget"], 32000);
+        assert_eq!(generation["thinkingConfig"]["includeThoughts"], true);
     }
 
     #[test]

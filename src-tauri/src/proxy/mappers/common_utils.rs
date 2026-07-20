@@ -16,6 +16,41 @@ pub struct RequestConfig {
     pub image_config: Option<Value>,
 }
 
+const IMAGE_PROMPT_PREFIX: &str = "Create exactly one image that visually represents the following user prompt. Do not answer the prompt, do not provide advice, and do not output explanatory text. The output must be image content only.\n\nUser prompt:\n";
+
+pub fn force_image_generation_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return IMAGE_PROMPT_PREFIX.trim_end().to_string();
+    }
+    if trimmed.starts_with(IMAGE_PROMPT_PREFIX) {
+        return trimmed.to_string();
+    }
+    format!("{}{}", IMAGE_PROMPT_PREFIX, trimmed)
+}
+
+pub fn force_image_generation_prompts_in_contents(contents: &mut Value) {
+    let Some(contents) = contents.as_array_mut() else {
+        return;
+    };
+
+    for content in contents {
+        if content.get("role").and_then(Value::as_str).unwrap_or("user") != "user" {
+            continue;
+        }
+        let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if let Some(text_part) = parts
+            .iter_mut()
+            .find(|part| part.get("text").and_then(Value::as_str).is_some())
+        {
+            let text = text_part.get("text").and_then(Value::as_str).unwrap_or("");
+            text_part["text"] = json!(force_image_generation_prompt(text));
+        }
+    }
+}
+
 pub fn resolve_request_config(
     original_model: &str,
     mapped_model: &str,
@@ -28,7 +63,9 @@ pub fn resolve_request_config(
     // 1. Image Generation Check (Priority)
     // Detect via the original requested alias OR the account-resolved model name, because the
     // dynamic model rewrite may turn "gemini-3-pro-image" into e.g. "gemini-3.1-flash-image".
-    if original_model.to_lowercase().contains("-image") || mapped_model.contains("-image") {
+    if crate::proxy::common::model_mapping::is_image_generation_model(original_model)
+        || crate::proxy::common::model_mapping::is_image_generation_model(mapped_model)
+    {
         // [RESOLVE #1694] Improved priority logic:
         // 1. First parse inferred config from model suffix and OpenAI parameters
         let (mut inferred_config, parsed_base_model) =
@@ -72,7 +109,9 @@ pub fn resolve_request_config(
 
         // Prefer the account-resolved concrete image model (mapped_model) for the upstream
         // call; fall back to the parsed base of the requested alias if it wasn't resolved.
-        let upstream_model = if mapped_model.contains("-image") {
+        let upstream_model = if crate::proxy::common::model_mapping::is_image_generation_model(
+            mapped_model,
+        ) {
             mapped_model.to_string()
         } else {
             parsed_base_model
@@ -653,6 +692,14 @@ mod tests {
         let (config_4k_wide, _) = parse_image_config("gemini-3-pro-image-4k-21x9");
         assert_eq!(config_4k_wide["imageSize"], "4K");
         assert_eq!(config_4k_wide["aspectRatio"], "21:9");
+    }
+
+    #[test]
+    fn image_prompt_is_forced_once() {
+        let prompt = force_image_generation_prompt("Banana says hello");
+        assert!(prompt.contains("output must be image content only"));
+        assert!(prompt.ends_with("Banana says hello"));
+        assert_eq!(force_image_generation_prompt(&prompt), prompt);
     }
 
     #[test]

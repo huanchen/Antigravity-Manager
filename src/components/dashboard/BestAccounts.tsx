@@ -27,43 +27,36 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
         .filter(a => a.quotaVal > 0)
         .sort((a, b) => b.quotaVal - a.quotaVal);
 
-    const claudeSorted = accounts
+    const claudeSonnetSorted = accounts
         .filter(a => a.id !== currentAccountId)
         .map(a => ({
             ...a,
-            quotaVal: findQuotaModel(a.quota?.models, 'claude')?.percentage || 0,
+            quotaVal: findQuotaModel(a.quota?.models, 'claude-sonnet')?.percentage || 0,
+        }))
+        .filter(a => a.quotaVal > 0)
+        .sort((a, b) => b.quotaVal - a.quotaVal);
+
+    const claudeOpusSorted = accounts
+        .filter(a => a.id !== currentAccountId)
+        .map(a => ({
+            ...a,
+            quotaVal: findQuotaModel(a.quota?.models, 'claude-opus')?.percentage || 0,
         }))
         .filter(a => a.quotaVal > 0)
         .sort((a, b) => b.quotaVal - a.quotaVal);
 
     let bestGemini = geminiSorted[0];
-    let bestClaude = claudeSorted[0];
-
-    // 2. 如果推荐是同一个账号，且有其他选择，尝试寻找最优的"不同账号"组合
-    if (bestGemini && bestClaude && bestGemini.id === bestClaude.id) {
-        const nextGemini = geminiSorted[1];
-        const nextClaude = claudeSorted[1];
-
-        // 方案A: 保持 Gemini 最优，换 Claude 次优
-        // 方案B: 换 Gemini 次优，保持 Claude 最优
-        // 比较标准：两者配额之和最大化 (或者优先保住 100% 的那个)
-
-        const scoreA = bestGemini.quotaVal + (nextClaude?.quotaVal || 0);
-        const scoreB = (nextGemini?.quotaVal || 0) + bestClaude.quotaVal;
-
-        if (nextClaude && (!nextGemini || scoreA >= scoreB)) {
-            // 选方案A：换 Claude
-            bestClaude = nextClaude;
-        } else if (nextGemini) {
-            // 选方案B：换 Gemini
-            bestGemini = nextGemini;
-        }
-        // 如果都没有次优解（例如只有一个账号），则保持原样
-    }
+    const bestClaudeSonnet = claudeSonnetSorted[0];
+    const bestClaudeOpus = claudeOpusSorted[0];
 
     // 构造最终用于显示的视图模型 (兼容原有渲染逻辑)
     const bestGeminiRender = bestGemini ? { ...bestGemini, geminiQuota: bestGemini.quotaVal } : undefined;
-    const bestClaudeRender = bestClaude ? { ...bestClaude, claudeQuota: bestClaude.quotaVal } : undefined;
+    const bestClaudeSonnetRender = bestClaudeSonnet
+        ? { ...bestClaudeSonnet, claudeQuota: bestClaudeSonnet.quotaVal }
+        : undefined;
+    const bestClaudeOpusRender = bestClaudeOpus
+        ? { ...bestClaudeOpus, claudeQuota: bestClaudeOpus.quotaVal }
+        : undefined;
 
     return (
         <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
@@ -88,38 +81,55 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
                     </div>
                 )}
 
-                {/* Claude 最佳 */}
-                {bestClaudeRender && (
+                {/* Claude Sonnet 最佳 */}
+                {bestClaudeSonnetRender && (
                     <div className="flex items-center justify-between p-2.5 bg-cyan-50 dark:bg-cyan-900/20 rounded-lg border border-cyan-100 dark:border-cyan-900/30">
                         <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-cyan-600 dark:text-cyan-400 font-medium mb-0.5">{t('dashboard.for_claude')}</div>
+                            <div className="text-[10px] text-cyan-600 dark:text-cyan-400 font-medium mb-0.5">{t('dashboard.for_claude_sonnet', 'Claude Sonnet')}</div>
                             <div className="font-medium text-sm text-gray-900 dark:text-base-content truncate">
-                                {bestClaudeRender.email}
+                                {bestClaudeSonnetRender.email}
                             </div>
                         </div>
                         <div className="ml-2 px-2 py-0.5 bg-cyan-500 text-white text-xs font-semibold rounded-full">
-                            {bestClaudeRender.claudeQuota}%
+                            {bestClaudeSonnetRender.claudeQuota}%
                         </div>
                     </div>
                 )}
 
-                {(!bestGeminiRender && !bestClaudeRender) && (
+                {/* Claude Opus 最佳 */}
+                {bestClaudeOpusRender && (
+                    <div className="flex items-center justify-between p-2.5 bg-teal-50 dark:bg-teal-900/20 rounded-lg border border-teal-100 dark:border-teal-900/30">
+                        <div className="flex-1 min-w-0">
+                            <div className="text-[10px] text-teal-600 dark:text-teal-400 font-medium mb-0.5">{t('dashboard.for_claude_opus', 'Claude Opus')}</div>
+                            <div className="font-medium text-sm text-gray-900 dark:text-base-content truncate">
+                                {bestClaudeOpusRender.email}
+                            </div>
+                        </div>
+                        <div className="ml-2 px-2 py-0.5 bg-teal-500 text-white text-xs font-semibold rounded-full">
+                            {bestClaudeOpusRender.claudeQuota}%
+                        </div>
+                    </div>
+                )}
+
+                {(!bestGeminiRender && !bestClaudeSonnetRender && !bestClaudeOpusRender) && (
                     <div className="text-center py-4 text-gray-400 text-sm">
                         {t('accounts.no_data')}
                     </div>
                 )}
             </div>
 
-            {(bestGeminiRender || bestClaudeRender) && onSwitch && (
+            {(bestGeminiRender || bestClaudeSonnetRender || bestClaudeOpusRender) && onSwitch && (
                 <div className="mt-auto pt-3">
                     <button
                         className="w-full px-3 py-1.5 bg-blue-500 text-white text-xs font-medium rounded-lg hover:bg-blue-600 transition-colors"
                         onClick={() => {
                             // 优先切换到配额更高的账号
-                            let targetId = bestGeminiRender?.id;
-                            if (bestClaudeRender && (!bestGeminiRender || bestClaudeRender.claudeQuota > bestGeminiRender.geminiQuota)) {
-                                targetId = bestClaudeRender.id;
-                            }
+                            const candidates = [
+                                bestGeminiRender ? { id: bestGeminiRender.id, quota: bestGeminiRender.geminiQuota } : undefined,
+                                bestClaudeSonnetRender ? { id: bestClaudeSonnetRender.id, quota: bestClaudeSonnetRender.claudeQuota } : undefined,
+                                bestClaudeOpusRender ? { id: bestClaudeOpusRender.id, quota: bestClaudeOpusRender.claudeQuota } : undefined,
+                            ].filter((candidate): candidate is { id: string; quota: number } => Boolean(candidate));
+                            const targetId = candidates.sort((a, b) => b.quota - a.quota)[0]?.id;
 
                             if (onSwitch && targetId) {
                                 onSwitch(targetId);

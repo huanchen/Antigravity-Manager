@@ -15,6 +15,11 @@ import {
     ensurePinnedImageSelector,
     DEFAULT_IMAGE_PIN_SELECTOR,
     resolveQuotaModels,
+    isQuotaModelProtected,
+    isSupportedClaudeQuotaModel,
+    CLAUDE_SONNET_QUOTA_MODEL,
+    CLAUDE_OPUS_QUOTA_MODEL,
+    LEGACY_CLAUDE_QUOTA_MODEL,
     type ModelCategory,
 } from '../../utils/modelCategory';
 // Compile-time guard: if findImageQuotaModel is removed from the config re-export,
@@ -63,8 +68,11 @@ const categorizeCases: Array<[string, ModelCategory]> = [
     ['gemini-3-pro-image', 'gemini-pro-image'],
     ['imagen-3.0', 'gemini-pro-image'],
     // claude
-    ['claude-sonnet-4-6', 'claude'],
-    ['claude-opus-4-6-thinking', 'claude'],
+    ['claude-sonnet-4-6', 'claude-sonnet'],
+    ['claude-sonnet-4-6-thinking', 'claude-sonnet'],
+    ['claude-opus-4-6-thinking', 'claude-opus'],
+    ['claude-opus-4-6', 'claude-opus'],
+    ['claude', 'claude'],
     // edge / other providers
     ['gpt-4o', 'other'],
     ['gpt-oss-120b-medium', 'other'],
@@ -81,7 +89,10 @@ const protectionCases: Array<[string, string | null]> = [
     ['gemini-3.1-pro', 'gemini-3-pro-high'],
     ['gemini-3.1-flash-image', 'gemini-3.1-flash-image'],
     ['gemini-3-pro-image', 'gemini-3-pro-image'],
-    ['claude-sonnet-4-6', 'claude'],
+    ['claude-sonnet-4-6', 'claude-sonnet-4-6'],
+    ['claude-sonnet-4-6-thinking', 'claude-sonnet-4-6'],
+    ['claude-opus-4-6-thinking', 'claude-opus-4-6-thinking'],
+    ['claude-opus-4-6', 'claude-opus-4-6-thinking'],
     ['gpt-4o', null],
 ];
 
@@ -123,9 +134,11 @@ const findCases: Array<[Array<{ name: string }>, ModelCategory, string | null]> 
     [[{ name: 'gemini-2.5-pro' }], 'gemini-pro', 'gemini-2.5-pro'],
     // Flash: preferred chain
     [[{ name: 'gemini-3-flash-agent' }, { name: 'gemini-3.5-flash-low' }], 'gemini-flash', 'gemini-3-flash-agent'],
-    // Claude: preferred chain
+    // Claude: each supported bucket has an independent preferred chain
+    [[{ name: 'claude-sonnet-4-6' }, { name: 'claude-opus-4-6-thinking' }], 'claude-sonnet', 'claude-sonnet-4-6'],
+    [[{ name: 'claude-opus-4-6-thinking' }], 'claude-opus', 'claude-opus-4-6-thinking'],
+    // Legacy generic lookup remains compatible and prefers Sonnet
     [[{ name: 'claude-sonnet-4-6' }, { name: 'claude-opus-4-6-thinking' }], 'claude', 'claude-sonnet-4-6'],
-    [[{ name: 'claude-opus-4-6-thinking' }], 'claude', 'claude-opus-4-6-thinking'],
     // Empty
     [[], 'gemini-pro', null],
     // Fallback to categorizeModel
@@ -169,6 +182,41 @@ test('resolveQuotaModels: legacy image selector with no image API model returns 
     assertEqual(results.length, 1);
     assertEqual(results[0].selectionKey, 'category:gemini-image');
     assertEqual(results[0].model, undefined);
+});
+
+test('resolveQuotaModels: Claude selectors remain separate when both are pinned', () => {
+    const models = [
+        { name: CLAUDE_SONNET_QUOTA_MODEL, percentage: 12 },
+        { name: CLAUDE_OPUS_QUOTA_MODEL, percentage: 88 },
+    ];
+    const results = resolveQuotaModels(models, [CLAUDE_SONNET_QUOTA_MODEL, CLAUDE_OPUS_QUOTA_MODEL]);
+    assertEqual(results.length, 2);
+    assertEqual(results[0].selectionKey, 'category:claude-sonnet');
+    assertEqual(results[0].model?.percentage, 12);
+    assertEqual(results[1].selectionKey, 'category:claude-opus');
+    assertEqual(results[1].model?.percentage, 88);
+});
+
+test('resolveQuotaModels: legacy Claude selector expands without copying quota', () => {
+    const results = resolveQuotaModels(
+        [{ name: CLAUDE_SONNET_QUOTA_MODEL, percentage: 42 }],
+        [LEGACY_CLAUDE_QUOTA_MODEL],
+    );
+    assertEqual(results.length, 2);
+    assertEqual(results[0].selectorId, CLAUDE_SONNET_QUOTA_MODEL);
+    assertEqual(results[0].model?.percentage, 42);
+    assertEqual(results[1].selectorId, CLAUDE_OPUS_QUOTA_MODEL);
+    assertEqual(results[1].model, undefined);
+});
+
+test('Claude protection keys are independent but honor legacy marker', () => {
+    assertEqual(isSupportedClaudeQuotaModel(CLAUDE_SONNET_QUOTA_MODEL), true);
+    assertEqual(isSupportedClaudeQuotaModel(CLAUDE_OPUS_QUOTA_MODEL), true);
+    assertEqual(isSupportedClaudeQuotaModel('claude-sonnet-4-6-thinking'), false);
+    assertEqual(isQuotaModelProtected([CLAUDE_SONNET_QUOTA_MODEL], CLAUDE_SONNET_QUOTA_MODEL), true);
+    assertEqual(isQuotaModelProtected([CLAUDE_SONNET_QUOTA_MODEL], CLAUDE_OPUS_QUOTA_MODEL), false);
+    assertEqual(isQuotaModelProtected([LEGACY_CLAUDE_QUOTA_MODEL], CLAUDE_SONNET_QUOTA_MODEL), true);
+    assertEqual(isQuotaModelProtected([LEGACY_CLAUDE_QUOTA_MODEL], CLAUDE_OPUS_QUOTA_MODEL), true);
 });
 
 // ── findImageQuotaModel ───────────────────────────────────────────────────

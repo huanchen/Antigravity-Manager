@@ -5,7 +5,15 @@ import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
-import { MODEL_CONFIG, sortModels, getModelProtectionKey, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
+import {
+    MODEL_CONFIG,
+    sortModels,
+    getModelProtectionKey,
+    resolveQuotaModels,
+    ensurePinnedImageSelector,
+    isSupportedClaudeQuotaModel,
+    isQuotaModelProtected,
+} from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
 
@@ -126,12 +134,18 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
         }
 
         // 应用排序并过滤过期模型
-        return sortModels(models).filter(m => m.id !== 'claude-sonnet-4-6-thinking' && m.id !== 'claude-sonnet-4-5-thinking' && m.id !== 'claude-opus-4-5-thinking');
+        return sortModels(models).filter(m => {
+            const id = m.id.toLowerCase();
+            // Keep the two upstream Claude quota buckets visible; hide stale
+            // Claude thinking aliases that cannot be protected independently.
+            if (id.startsWith('claude-')) return isSupportedClaudeQuotaModel(id);
+            return true;
+        });
     }, [config, account, showAllQuotas]);
 
     const isModelProtected = (key?: string) => {
         if (!key) return false;
-        return account.protected_models?.includes(key);
+        return isQuotaModelProtected(account.protected_models, key);
     };
 
     return (

@@ -8,17 +8,19 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info}; // Import Engine trait for encode method
 
 use crate::proxy::mappers::openai::{
-    transform_openai_request, transform_openai_response, OpenAIMessage, OpenAIRequest,
+    transform_openai_request, OpenAIContent, OpenAIContentBlock,
+    OpenAIMessage, OpenAIRequest, OpenAIResponse, OpenAIUsage, PromptTokensDetails,
 };
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
 use crate::proxy::debug_logger;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
 use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
+    account_rotation_attempts, acquire_global_image_permit, acquire_image_account_permit,
+    apply_retry_strategy, determine_retry_strategy, image_max_attempts, is_retryable_image_error,
+    should_rotate_account, RetryStrategy,
 };
 use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
@@ -27,25 +29,384 @@ use axum::http::HeaderMap;
 use std::collections::VecDeque;
 use tokio::time::Duration;
 
-/// Return true only when a streamed chunk contains an actual error event.
-///
-/// Responses lifecycle envelopes legitimately contain `"error": null`, and
-/// assistant text may also mention the word "error". A substring search would
-/// misclassify both as failures and rotate otherwise healthy accounts.
-fn stream_chunk_has_error_event(bytes: &[u8]) -> bool {
-    String::from_utf8_lossy(bytes).lines().any(|line| {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPeekDisposition {
+    Ignore,
+    Meaningful,
+    Error,
+}
+
+/// Classify converted SSE without mistaking Responses lifecycle frames or
+/// usage-only frames for a successful first model output.
+fn classify_stream_chunk(bytes: &[u8]) -> StreamPeekDisposition {
+    let mut meaningful = false;
+    for line in String::from_utf8_lossy(bytes).lines() {
         let Some(data) = line.trim_start().strip_prefix("data:") else {
-            return false;
+            continue;
         };
+        if data.trim() == "[DONE]" {
+            continue;
+        }
         let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
-            return false;
+            continue;
         };
 
-        matches!(
+        if matches!(
             payload.get("type").and_then(Value::as_str),
             Some("error" | "response.failed")
         ) || payload.get("error").is_some_and(|error| !error.is_null())
+            || payload
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .is_some_and(|error| !error.is_null())
+        {
+            return StreamPeekDisposition::Error;
+        }
+
+        match payload.get("type").and_then(Value::as_str) {
+            Some("response.created" | "response.in_progress") => {}
+            Some("response.incomplete") => {
+                let code = payload
+                    .get("response")
+                    .and_then(|response| response.get("error"))
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str);
+                if matches!(code, Some("empty_response" | "upstream_interrupted" | "upstream_malformed_stream")) {
+                    return StreamPeekDisposition::Error;
+                }
+                meaningful = true;
+            }
+            Some("response.completed")
+            | Some("response.output_item.added")
+            | Some("response.output_text.delta")
+            | Some("response.function_call_arguments.delta")
+            | Some("response.custom_tool_call_input.delta") => meaningful = true,
+            _ => {
+                if payload
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice
+                                .get("finish_reason")
+                                .is_some_and(|reason| !reason.is_null())
+                                || choice
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                                || choice
+                                    .get("delta")
+                                    .is_some_and(|delta| {
+                                        delta
+                                            .get("content")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|text| !text.is_empty())
+                                            || delta
+                                                .get("reasoning_content")
+                                                .and_then(Value::as_str)
+                                                .is_some_and(|text| !text.is_empty())
+                                            || delta
+                                                .get("tool_calls")
+                                                .and_then(Value::as_array)
+                                                .is_some_and(|calls| !calls.is_empty())
+                                    })
+                        })
+                    })
+                {
+                    meaningful = true;
+                }
+            }
+        }
+    }
+
+    if meaningful {
+        StreamPeekDisposition::Meaningful
+    } else {
+        StreamPeekDisposition::Ignore
+    }
+}
+
+fn stream_chunk_has_error_event(bytes: &[u8]) -> bool {
+    classify_stream_chunk(bytes) == StreamPeekDisposition::Error
+}
+
+fn model_name_explicitly_selects_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ["-thinking", "-low", "-medium", "-high", "-agent"]
+        .iter()
+        .any(|suffix| model.ends_with(suffix))
+}
+
+fn model_requires_positive_thinking_budget(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("gemini-pro-agent")
+        || model.contains("gemini-3.1-pro")
+        || model.contains("gemini-3-pro")
+        || model.contains("claude-opus") && model.contains("thinking")
+}
+
+fn responses_terminal_metadata(
+    response: &crate::proxy::mappers::openai::OpenAIResponse,
+) -> (&'static str, Value) {
+    let mut saw_interrupted = false;
+    let mut saw_filter = false;
+    let mut saw_length = false;
+    for choice in &response.choices {
+        match choice.finish_reason.as_deref() {
+            Some("length") => saw_length = true,
+            Some("content_filter") => saw_filter = true,
+            Some(_) => {}
+            None => saw_interrupted = true,
+        }
+    }
+    if saw_length {
+        ("incomplete", json!({"reason": "max_output_tokens"}))
+    } else if saw_filter {
+        ("incomplete", json!({"reason": "content_filter"}))
+    } else if saw_interrupted || response.choices.is_empty() {
+        ("incomplete", json!({"reason": "interrupted"}))
+    } else {
+        ("completed", Value::Null)
+    }
+}
+
+/// Estimate a token count only for the usage fallback path. The provider's
+/// usage metadata remains authoritative; this prevents a missing metadata tail
+/// from being exposed to downstream clients as `0/0`.
+fn estimate_tokens_from_text(text: &str) -> u32 {
+    let mut ascii = 0u32;
+    let mut non_ascii = 0u32;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii = ascii.saturating_add(1);
+        } else {
+            non_ascii = non_ascii.saturating_add(1);
+        }
+    }
+    non_ascii.saturating_add(ascii.saturating_add(3) / 4).max(1)
+}
+
+fn estimate_openai_request_tokens(request: &OpenAIRequest) -> u32 {
+    serde_json::to_string(request)
+        .map(|value| estimate_tokens_from_text(&value))
+        .unwrap_or(1)
+}
+
+fn ensure_openai_usage(response: &mut OpenAIResponse, fallback_input_tokens: u32) {
+    let fallback_output_tokens = serde_json::to_string(&response.choices)
+        .map(|value| estimate_tokens_from_text(&value))
+        .unwrap_or(1);
+
+    match response.usage.as_mut() {
+        Some(usage) => {
+            if usage.prompt_tokens == 0 {
+                usage.prompt_tokens = fallback_input_tokens.max(1);
+            }
+            // A reasoning-only response legitimately has visible output 0, but
+            // its completion count must still include the hidden tokens.
+            let reasoning_tokens = usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens)
+                .unwrap_or(0);
+            if usage.completion_tokens == 0 && reasoning_tokens == 0 {
+                usage.completion_tokens = fallback_output_tokens.max(1);
+            }
+            usage.total_tokens = usage
+                .total_tokens
+                .max(usage.prompt_tokens.saturating_add(usage.completion_tokens));
+        }
+        None => {
+            let prompt_tokens = fallback_input_tokens.max(1);
+            let completion_tokens = fallback_output_tokens.max(1);
+            response.usage = Some(OpenAIUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(0),
+                }),
+                completion_tokens_details: None,
+                input_tokens_by_modality: None,
+                raw_output_tokens: Some(completion_tokens),
+                total_thought_tokens: None,
+                total_tool_use_tokens: None,
+                gemini_total_tokens: None,
+            });
+        }
+    }
+}
+
+/// Convert the internal Chat Completion shape to the Responses JSON shape.
+/// Keep `MAX_TOKENS`/`length` as `incomplete` instead of claiming completion.
+fn transform_to_responses_api(response: &OpenAIResponse) -> Value {
+    let finish_reason = response
+        .choices
+        .first()
+        .and_then(|choice| choice.finish_reason.as_deref());
+    let incomplete_reason = match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        // A missing finish reason means the upstream body ended without a
+        // terminal candidate. Never advertise that partial body as completed.
+        None => Some("interrupted"),
+        _ => None,
+    };
+    let response_status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
+
+    let mut output = Vec::new();
+    if let Some(choice) = response.choices.first() {
+        let text = match choice.message.content.as_ref() {
+            Some(OpenAIContent::String(text)) => text.clone(),
+            Some(OpenAIContent::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    OpenAIContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        };
+
+        if !text.is_empty() || choice.message.tool_calls.is_none() {
+            output.push(json!({
+                "id": format!("msg_{}", response.id),
+                "type": "message",
+                "status": response_status,
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }]
+            }));
+        }
+        if let Some(tool_calls) = &choice.message.tool_calls {
+            for tool_call in tool_calls {
+                if let Some(function) = &tool_call.function {
+                    output.push(json!({
+                        "id": tool_call.id,
+                        "type": "function_call",
+                        "status": response_status,
+                        "call_id": tool_call.id,
+                        "name": function.name,
+                        "arguments": function.arguments
+                    }));
+                }
+            }
+        }
+    }
+
+    let usage = response.usage.as_ref().map(OpenAIUsage::to_responses_usage_value);
+    json!({
+        "id": response.id,
+        "object": "response",
+        "created_at": response.created,
+        "status": response_status,
+        "error": null,
+        "incomplete_details": incomplete_reason.map(|reason| json!({ "reason": reason })),
+        "model": response.model,
+        "output": output,
+        "usage": usage
     })
+}
+
+/// Resolve a public model alias without discarding the caller's output limit.
+///
+/// Variant metadata describes an upstream model's hard limits, not a replacement
+/// for `max_tokens`. Flash thinking stays opt-in unless the model name itself
+/// selects a thinking tier. Pro checkpoints are the exception: they reject a zero
+/// thinking budget, so they always receive their verified positive minimum.
+fn apply_openai_variant(
+    request: &mut OpenAIRequest,
+) -> Option<crate::proxy::common::variant_mapping::RealModelSpec> {
+    use crate::proxy::mappers::openai::models::ThinkingConfig;
+
+    let original_model = request.model.clone();
+    let original_max_tokens = request.max_tokens;
+    let explicit_disabled = request
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.thinking_type.as_deref())
+        == Some("disabled");
+    let explicit_thinking = request.thinking.as_ref().is_some_and(|thinking| {
+        matches!(thinking.thinking_type.as_deref(), Some("enabled" | "adaptive"))
+            || thinking.budget_tokens.is_some()
+            || thinking.effort.is_some()
+    });
+    let client_budget = request
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.budget_tokens);
+    let original_selects_variant = model_name_explicitly_selects_thinking(&original_model);
+    let requires_variant_without_hint = {
+        let lower = original_model.to_ascii_lowercase();
+        lower.contains("gemini-3.1-pro")
+            || lower.contains("gemini-3-pro")
+            || lower.contains("gemini-pro-agent")
+    };
+    // Generic Pro aliases are intentionally conservative.  The public model
+    // router advertises `gemini-3.1-pro` as the verified low checkpoint; the
+    // high/agent checkpoint is selected only by an explicit tier or budget.
+    let conservative_pro_tier = if requires_variant_without_hint
+        && !explicit_thinking
+        && !original_selects_variant
+        && client_budget.is_none()
+    {
+        Some(crate::proxy::common::variant_mapping::VariantTier::Low)
+    } else {
+        None
+    };
+    let spec = crate::proxy::common::variant_mapping::resolve_with_tier(
+        &original_model,
+        conservative_pro_tier,
+        client_budget,
+    )?;
+
+    // A plain canonical Flash request is not a request for the high-thinking
+    // agent checkpoint. Leave it on the normal router so an omitted thinking
+    // field cannot turn into a contradictory agent+budget=0 request.
+    if !explicit_thinking
+        && !original_selects_variant
+        && client_budget.is_none()
+        && !requires_variant_without_hint
+        && crate::proxy::common::variant_mapping::resolve_non_variant_model(&original_model)
+            .is_none()
+    {
+        return None;
+    }
+
+    request.model = spec.id.to_string();
+    let requires_thinking = model_requires_positive_thinking_budget(spec.id);
+    let enable_thinking = requires_thinking
+        || (!explicit_disabled
+            && (explicit_thinking || model_name_explicitly_selects_thinking(&original_model)));
+
+    if spec.thinking_budget == 0 || !enable_thinking {
+        request.thinking = Some(ThinkingConfig {
+            thinking_type: Some("disabled".to_string()),
+            budget_tokens: Some(0),
+            effort: None,
+        });
+        if spec.thinking_budget == 0 {
+            request.tools = None;
+            request.tool_choice = None;
+        }
+    } else {
+        request.thinking = Some(ThinkingConfig {
+            thinking_type: Some("enabled".to_string()),
+            budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
+            effort: None,
+        });
+    }
+
+    request.max_tokens = original_max_tokens.or(Some(spec.max_output_tokens));
+    Some(spec)
 }
 
 /// Visible Codex commentary is part of the local transcript, not Gemini
@@ -70,8 +431,12 @@ fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool 
 
 #[cfg(test)]
 mod stream_peek_tests {
+    use super::classify_stream_chunk;
     use super::is_codex_transcript_only_assistant_message;
+    use super::responses_terminal_metadata;
     use super::stream_chunk_has_error_event;
+    use super::StreamPeekDisposition;
+    use crate::proxy::mappers::openai::transform_openai_response;
     use serde_json::json;
 
     #[test]
@@ -81,6 +446,7 @@ data: {"type":"response.created","response":{"status":"in_progress","error":null
 
 "#;
         assert!(!stream_chunk_has_error_event(chunk));
+        assert_eq!(classify_stream_chunk(chunk), StreamPeekDisposition::Ignore);
     }
 
     #[test]
@@ -106,6 +472,19 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
 
 "#;
         assert!(!stream_chunk_has_error_event(chunk));
+        assert_eq!(
+            classify_stream_chunk(chunk),
+            StreamPeekDisposition::Meaningful
+        );
+    }
+
+    #[test]
+    fn upstream_interrupted_responses_terminal_is_a_peek_error() {
+        let chunk = br#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","error":{"code":"upstream_interrupted"}}}
+
+"#;
+        assert_eq!(classify_stream_chunk(chunk), StreamPeekDisposition::Error);
     }
 
     #[test]
@@ -152,12 +531,40 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             "done"
         ));
     }
+
+    #[test]
+    fn max_tokens_is_incomplete_in_synchronous_responses() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "partial"}]},
+                "finishReason": "MAX_TOKENS"
+            }]
+        });
+        let response = transform_openai_response(&gemini, None, 1, None);
+        let (status, details) = responses_terminal_metadata(&response);
+        assert_eq!(status, "incomplete");
+        assert_eq!(details["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn missing_finish_reason_is_incomplete_in_responses_shape() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "partial"}]}
+            }]
+        });
+        let response = transform_openai_response(&gemini, None, 1, None);
+        let rendered = super::transform_to_responses_api(&response);
+        assert_eq!(rendered["status"], "incomplete");
+        assert_eq!(rendered["incomplete_details"]["reason"], "interrupted");
+    }
 }
 
 #[cfg(test)]
 mod variant_tests {
+    use super::{apply_openai_variant, model_name_explicitly_selects_thinking};
     use crate::proxy::common::variant_mapping;
-    use crate::proxy::mappers::openai::models::ThinkingConfig;
+    use crate::proxy::mappers::openai::models::{OpenAIRequest, ThinkingConfig};
 
     #[test]
     fn openai_opus_preserves_client_budget_when_present() {
@@ -185,6 +592,85 @@ mod variant_tests {
         };
 
         assert_eq!(request_thinking.budget_tokens, Some(1_024));
+    }
+
+    #[test]
+    fn variant_keeps_small_max_tokens_when_thinking_is_not_requested() {
+        let mut request = OpenAIRequest {
+            model: "gemini-3.5-flash".to_string(),
+            max_tokens: Some(128),
+            ..Default::default()
+        };
+        assert!(apply_openai_variant(&mut request).is_none());
+        assert_eq!(request.model, "gemini-3.5-flash");
+        assert_eq!(request.max_tokens, Some(128));
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn explicit_flash_tier_enables_thinking_but_preserves_client_limit_for_compensation() {
+        let mut request = OpenAIRequest {
+            model: "gemini-3.5-flash-low".to_string(),
+            max_tokens: Some(128),
+            ..Default::default()
+        };
+        apply_openai_variant(&mut request).expect("flash tier must resolve");
+        assert_eq!(request.max_tokens, Some(128));
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.thinking_type.as_deref()),
+            Some("enabled")
+        );
+        assert!(request
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens)
+            .unwrap_or(0)
+            > 0);
+    }
+
+    #[test]
+    fn pro_alias_never_emits_zero_budget() {
+        let mut request = OpenAIRequest {
+            model: "gemini-3.1-pro".to_string(),
+            max_tokens: Some(128),
+            thinking: Some(ThinkingConfig {
+                thinking_type: Some("disabled".to_string()),
+                budget_tokens: Some(0),
+                effort: None,
+            }),
+            ..Default::default()
+        };
+        apply_openai_variant(&mut request).expect("pro alias must resolve");
+        assert_eq!(request.max_tokens, Some(128));
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.thinking_type.as_deref()),
+            Some("enabled")
+        );
+        assert!(request
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens)
+            .unwrap_or(0)
+            > 0);
+    }
+
+    #[test]
+    fn generic_pro_alias_defaults_to_verified_low_checkpoint() {
+        let mut request = OpenAIRequest {
+            model: "gemini-3.1-pro".to_string(),
+            ..Default::default()
+        };
+        let spec = apply_openai_variant(&mut request).expect("pro alias must resolve");
+        assert_eq!(spec.id, "gemini-3.1-pro-low");
+        assert_eq!(request.model, "gemini-3.1-pro-low");
+        assert_eq!(request.thinking.as_ref().and_then(|t| t.budget_tokens), Some(1001));
+    }
+
+    #[test]
+    fn variant_suffix_detection_is_conservative() {
+        assert!(model_name_explicitly_selects_thinking("gemini-3.5-flash-low"));
+        assert!(model_name_explicitly_selects_thinking("claude-opus-4-6-thinking"));
+        assert!(!model_name_explicitly_selects_thinking("gemini-3.5-flash"));
     }
 }
 
@@ -385,6 +871,9 @@ pub async fn handle_chat_completions(
         openai_req.stream
     );
     let debug_cfg = state.debug_logging.read().await.clone();
+    let experimental = state.experimental.read().await.clone();
+    let direct_non_stream = experimental.direct_non_stream;
+    let hide_thinking_output = experimental.hide_thinking_output;
 
     let mut force_rotate = false;
 
@@ -440,30 +929,13 @@ pub async fn handle_chat_completions(
         .thinking
         .as_ref()
         .and_then(|t| t.budget_tokens);
-    if let Some(spec) =
-        crate::proxy::common::variant_mapping::resolve(&openai_req.model, client_budget)
-    {
+    if let Some(spec) = apply_openai_variant(&mut openai_req) {
         tracing::info!(
             "[{}] [Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
             trace_id, openai_req.model, client_budget, spec.id, spec.thinking_budget, spec.max_output_tokens
         );
-        openai_req.model = spec.id.to_string();
-        if spec.thinking_budget == 0 {
-            // Non-thinking checkpoint model (e.g. gemini-3.1-flash-lite): disable thinking
-            // AND strip tools/tool_choice — per upstream spec §3 checkpoint requests carry
-            // no tools.
-            openai_req.thinking = None;
-            openai_req.tools = None;
-            openai_req.tool_choice = None;
-        } else {
-            openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
-                thinking_type: Some("enabled".to_string()),
-                budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
-                effort: None,
-            });
-        }
-        openai_req.max_tokens = Some(spec.max_output_tokens);
     }
+    let fallback_input_tokens = estimate_openai_request_tokens(&openai_req);
 
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
@@ -473,7 +945,7 @@ pub async fn handle_chat_completions(
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
     // [FIX] Ensure max_attempts is at least 2 to allow for internal retries
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let max_attempts = account_rotation_attempts(pool_size);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -572,7 +1044,7 @@ pub async fn handle_chat_completions(
 
         // 5. 发送请求
         let client_wants_stream = openai_req.stream;
-        let force_stream_internally = !client_wants_stream;
+        let force_stream_internally = !client_wants_stream && !direct_non_stream;
         let actual_stream = client_wants_stream || force_stream_internally;
 
         if force_stream_internally {
@@ -689,16 +1161,17 @@ pub async fn handle_chat_completions(
 
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
-                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream;
-                let mut openai_stream = create_openai_sse_stream(
+                use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_options;
+                let mut openai_stream = create_openai_sse_stream_with_options(
                     gemini_stream,
                     openai_req.model.clone(),
                     session_id,
                     message_count,
                     Some(client_tool_names.clone()),
+                    hide_thinking_output,
                 );
 
-                let mut first_data_chunk = None;
+                let mut peek_chunks = Vec::new();
                 let mut retry_this_account = false;
 
                 // Loop to skip heartbeats during peek
@@ -721,17 +1194,22 @@ pub async fn handle_chat_completions(
                                 continue;
                             }
 
-                            // Check for error events
-                            if stream_chunk_has_error_event(&bytes) {
-                                tracing::warn!("[OpenAI] Error detected during peek, retrying...");
-                                last_error = "Error event during peek".to_string();
-                                retry_this_account = true;
-                                break;
+                            match classify_stream_chunk(&bytes) {
+                                StreamPeekDisposition::Error => {
+                                    tracing::warn!("[OpenAI] Error detected during peek, retrying...");
+                                    last_error = "Error event during peek".to_string();
+                                    retry_this_account = true;
+                                    break;
+                                }
+                                StreamPeekDisposition::Ignore => {
+                                    peek_chunks.push(bytes);
+                                    continue;
+                                }
+                                StreamPeekDisposition::Meaningful => {
+                                    peek_chunks.push(bytes);
+                                    break;
+                                }
                             }
-
-                            // We found real data!
-                            first_data_chunk = Some(bytes);
-                            break;
                         }
                         Ok(Some(Err(e))) => {
                             tracing::warn!("[OpenAI] Stream error during peek: {}, retrying...", e);
@@ -760,12 +1238,12 @@ pub async fn handle_chat_completions(
                     continue; // Rotate to next account
                 }
 
-                // Combine first chunk with remaining stream
-                let combined_stream =
-                    futures::stream::once(
-                        async move { Ok::<Bytes, String>(first_data_chunk.unwrap()) },
-                    )
-                    .chain(openai_stream);
+                // Replay lifecycle frames only after meaningful model output has
+                // proved this account's attempt is viable.
+                let combined_stream = futures::stream::iter(
+                    peek_chunks.into_iter().map(Ok::<Bytes, String>),
+                )
+                .chain(openai_stream);
 
                 // [NEW] 针对 OpenAI 流增加 300 秒空闲超时保护
                 let combined_stream = async_stream::stream! {
@@ -777,7 +1255,17 @@ pub async fn handle_chat_completions(
                             Ok(None) => break,
                             Err(_) => {
                                 tracing::error!("[OpenAI-SSE] Idle timeout after 300s, terminating stream");
-                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+                                let error_chunk = json!({
+                                    "error": {
+                                        "type": "timeout_error",
+                                        "message": "OpenAI upstream stream idle timeout before completion",
+                                        "code": "upstream_timeout"
+                                    }
+                                });
+                                yield Ok::<Bytes, String>(Bytes::from(format!(
+                                    "data: {}\n\n",
+                                    serde_json::to_string(&error_chunk).unwrap_or_default()
+                                )));
                                 break;
                             }
                         }
@@ -849,7 +1337,8 @@ pub async fn handle_chat_completions(
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
 
                     match collect_stream_to_json(combined_stream).await {
-                        Ok(full_response) => {
+                        Ok(mut full_response) => {
+                            ensure_openai_usage(&mut full_response, fallback_input_tokens);
                             info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
                             if debug_logger::is_enabled(&debug_cfg) {
                                 let converted_response = serde_json::to_value(&full_response)
@@ -885,20 +1374,32 @@ pub async fn handle_chat_completions(
                         }
                         Err(e) => {
                             error!("[{}] Stream collection error: {}", trace_id, e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response());
+                            last_error = format!("Stream collection error: {e}");
+                            token_manager.record_failure(&account_id);
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }
             }
 
-            let gemini_resp: Value = response
-                .json()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            let gemini_resp: Value = match response.json().await {
+                Ok(value) => value,
+                Err(error) => {
+                    last_error = format!("Failed to parse Gemini response: {error}");
+                    token_manager.record_failure(&account_id);
+                    force_rotate = true;
+                    continue;
+                }
+            };
+            if let Err(error) =
+                super::common::validate_gemini_terminal_response(&gemini_resp)
+            {
+                last_error = error;
+                token_manager.record_failure(&account_id);
+                force_rotate = true;
+                continue;
+            }
 
             // [CACHE] 从 Gemini 响应中提取缓存信息，关闭反馈循环
             // 兼容两种格式: cachedContentTokenCount (旧), total_cached_tokens (新)
@@ -924,12 +1425,14 @@ pub async fn handle_chat_completions(
                 }
             }
 
-            let openai_response = transform_openai_response(
+            let mut openai_response = crate::proxy::mappers::openai::response::transform_openai_response_with_options(
                 &gemini_resp,
                 Some(&session_id),
                 message_count,
                 Some(&client_tool_names),
+                hide_thinking_output,
             );
+            ensure_openai_usage(&mut openai_response, fallback_input_tokens);
             if debug_logger::is_enabled(&debug_cfg) {
                 let converted_response = serde_json::to_value(&openai_response)
                     .unwrap_or_else(|e| json!({ "serialization_error": e.to_string() }));
@@ -1331,6 +1834,9 @@ pub async fn handle_completions(
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    let experimental = state.experimental.read().await.clone();
+    let direct_non_stream = experimental.direct_non_stream;
+    let hide_thinking_output = experimental.hide_thinking_output;
     debug!(
         "Received /v1/completions or /v1/responses payload: {:?}",
         body
@@ -1893,6 +2399,26 @@ pub async fn handle_completions(
         }
     };
 
+    // Keep the Responses/legacy path on the same canonical-model resolver as
+    // `/v1/chat/completions`.  Without this, a variant alias such as
+    // `gemini-3.1-pro` is routed to a different physical checkpoint (or is
+    // passed through unchanged) depending on the endpoint, which also changes
+    // the thinking budget and output limit sent to Gemini.
+    let client_budget = openai_req
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.budget_tokens);
+    if let Some(spec) = apply_openai_variant(&mut openai_req) {
+        tracing::info!(
+            "[Responses-Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
+            openai_req.model,
+            client_budget,
+            spec.id,
+            spec.thinking_budget,
+            spec.max_output_tokens
+        );
+    }
+
     // Safety: Inject empty message if needed
     if openai_req.messages.is_empty() {
         openai_req
@@ -1908,6 +2434,27 @@ pub async fn handle_completions(
                 name: None,
                 refusal: None,
             });
+    }
+
+    // Keep the Responses/legacy-completions path on the same canonical variant
+    // resolver as Chat Completions. Without this, a model such as
+    // `gemini-3.1-pro` takes a different checkpoint and thinking configuration
+    // depending only on the inbound endpoint, which is a common source of 400s
+    // and unexpectedly tiny responses.
+    let client_budget = openai_req
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.budget_tokens);
+    let canonical_model = openai_req.model.clone();
+    if let Some(spec) = apply_openai_variant(&mut openai_req) {
+        tracing::info!(
+            "[Responses-Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
+            canonical_model,
+            client_budget,
+            spec.id,
+            spec.thinking_budget,
+            spec.max_output_tokens
+        );
     }
 
     // [NEW v4.2.0] Context Management & Reasoning Replay
@@ -2114,6 +2661,7 @@ pub async fn handle_completions(
         }
     }
 
+    let fallback_input_tokens = estimate_openai_request_tokens(&openai_req);
     let assistant_turn_index = openai_req
         .messages
         .iter()
@@ -2123,7 +2671,7 @@ pub async fn handle_completions(
     let upstream = state.upstream.clone();
     let pool_size = token_manager.len();
     // [FIX] Ensure max_attempts is at least 2 to allow for internal retries
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let max_attempts = account_rotation_attempts(pool_size);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -2261,7 +2809,7 @@ pub async fn handle_completions(
 
         // [AUTO-CONVERSION] For Legacy/Codex as well
         let client_wants_stream = openai_req.stream;
-        let force_stream_internally = !client_wants_stream;
+        let force_stream_internally = !client_wants_stream && !direct_non_stream;
         let list_response = client_wants_stream || force_stream_internally;
         let method = if list_response {
             "streamGenerateContent"
@@ -2298,7 +2846,7 @@ pub async fn handle_completions(
         let status = response.status();
         if status.is_success() {
             // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
+            token_manager.mark_account_success_for_model(&email, Some(&mapped_model));
 
             if list_response {
                 use axum::body::Body;
@@ -2331,26 +2879,29 @@ pub async fn handle_completions(
 
                 if client_wants_stream {
                     let mut openai_stream = if is_codex_style {
-                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream;
-                        create_codex_sse_stream(
+                        use crate::proxy::mappers::openai::streaming::create_codex_sse_stream_with_options;
+                        create_codex_sse_stream_with_options(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id,
                             message_count,
                             assistant_turn_index,
+                            Some(fallback_input_tokens),
+                            hide_thinking_output,
                         )
                     } else {
-                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
-                        create_legacy_sse_stream(
+                        use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream_with_options;
+                        create_legacy_sse_stream_with_options(
                             gemini_stream,
                             openai_req.model.clone(),
                             session_id,
                             message_count,
+                            hide_thinking_output,
                         )
                     };
 
                     // [P1 FIX] Enhanced Peek logic (Reused from above/standard)
-                    let mut first_data_chunk = None;
+                    let mut peek_chunks = Vec::new();
                     let mut retry_this_account = false;
 
                     loop {
@@ -2370,13 +2921,21 @@ pub async fn handle_completions(
                                 {
                                     continue;
                                 }
-                                if stream_chunk_has_error_event(&bytes) {
-                                    last_error = "Error event during peek".to_string();
-                                    retry_this_account = true;
-                                    break;
+                                match classify_stream_chunk(&bytes) {
+                                    StreamPeekDisposition::Error => {
+                                        last_error = "Error event during peek".to_string();
+                                        retry_this_account = true;
+                                        break;
+                                    }
+                                    StreamPeekDisposition::Ignore => {
+                                        peek_chunks.push(bytes);
+                                        continue;
+                                    }
+                                    StreamPeekDisposition::Meaningful => {
+                                        peek_chunks.push(bytes);
+                                        break;
+                                    }
                                 }
-                                first_data_chunk = Some(bytes);
-                                break;
                             }
                             Ok(Some(Err(e))) => {
                                 last_error = format!("Stream error during peek: {}", e);
@@ -2400,9 +2959,9 @@ pub async fn handle_completions(
                         continue;
                     }
 
-                    let combined_stream = futures::stream::once(async move {
-                        Ok::<Bytes, String>(first_data_chunk.unwrap())
-                    })
+                    let combined_stream = futures::stream::iter(
+                        peek_chunks.into_iter().map(Ok::<Bytes, String>),
+                    )
                     .chain(openai_stream);
                     let converted_meta = json!({
                         "protocol": "openai",
@@ -2454,19 +3013,20 @@ pub async fn handle_completions(
                 } else {
                     // Forced Stream Internal -> Convert to Legacy JSON
                     // Use CHAT SSE Stream (so Collector can parse it)
-                    use crate::proxy::mappers::openai::streaming::create_openai_sse_stream;
+                    use crate::proxy::mappers::openai::streaming::create_openai_sse_stream_with_options;
                     // Note: We use create_openai_sse_stream regardless of is_codex_style here,
                     // because we just want the content aggregation which chat stream does well.
-                    let mut openai_stream = create_openai_sse_stream(
+                    let mut openai_stream = create_openai_sse_stream_with_options(
                         gemini_stream,
                         openai_req.model.clone(),
                         session_id,
                         message_count,
                         Some(client_tool_names.clone()),
+                        hide_thinking_output,
                     );
 
                     // Peek Logic (Repeated for safety/correctness on this stream type)
-                    let mut first_data_chunk = None;
+                    let mut peek_chunks = Vec::new();
                     let mut retry_this_account = false;
                     loop {
                         match tokio::time::timeout(
@@ -2485,13 +3045,21 @@ pub async fn handle_completions(
                                 {
                                     continue;
                                 }
-                                if stream_chunk_has_error_event(&bytes) {
-                                    last_error = "Error event in internal stream".to_string();
-                                    retry_this_account = true;
-                                    break;
+                                match classify_stream_chunk(&bytes) {
+                                    StreamPeekDisposition::Error => {
+                                        last_error = "Error event in internal stream".to_string();
+                                        retry_this_account = true;
+                                        break;
+                                    }
+                                    StreamPeekDisposition::Ignore => {
+                                        peek_chunks.push(bytes);
+                                        continue;
+                                    }
+                                    StreamPeekDisposition::Meaningful => {
+                                        peek_chunks.push(bytes);
+                                        break;
+                                    }
                                 }
-                                first_data_chunk = Some(bytes);
-                                break;
                             }
                             Ok(Some(Err(e))) => {
                                 last_error = format!("Internal stream error: {}", e);
@@ -2514,9 +3082,9 @@ pub async fn handle_completions(
                         continue;
                     }
 
-                    let combined_stream = futures::stream::once(async move {
-                        Ok::<Bytes, String>(first_data_chunk.unwrap())
-                    })
+                    let combined_stream = futures::stream::iter(
+                        peek_chunks.into_iter().map(Ok::<Bytes, String>),
+                    )
                     .chain(openai_stream);
                     let converted_meta = json!({
                         "protocol": "openai",
@@ -2541,10 +3109,13 @@ pub async fn handle_completions(
                     // Collect
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
                     match collect_stream_to_json(combined_stream).await {
-                        Ok(chat_resp) => {
+                        Ok(mut chat_resp) => {
+                            ensure_openai_usage(&mut chat_resp, fallback_input_tokens);
                             let is_responses_api = uri.path() == "/v1/responses";
 
                             if is_responses_api {
+                                let (response_status, incomplete_details) =
+                                    responses_terminal_metadata(&chat_resp);
                                 let mut output = Vec::new();
                                 for c in chat_resp.choices.iter() {
                                     let text = match &c.message.content {
@@ -2562,6 +3133,14 @@ pub async fn handle_completions(
                                         let mut msg_obj = serde_json::Map::new();
                                         msg_obj.insert("type".to_string(), json!("message"));
                                         msg_obj.insert("role".to_string(), json!("assistant"));
+                                        msg_obj.insert(
+                                            "status".to_string(),
+                                            json!(if response_status == "completed" {
+                                                "completed"
+                                            } else {
+                                                "incomplete"
+                                            }),
+                                        );
 
                                         if has_content {
                                             msg_obj.insert("content".to_string(), json!(text));
@@ -2593,13 +3172,17 @@ pub async fn handle_completions(
                                     })
                                 };
 
-                                let resp = json!({
+                                let _legacy_resp = json!({
                                     "type": "response",
                                     "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
-                                    "status": "completed",
+                                    "status": response_status,
                                     "output": output,
+                                    "incomplete_details": incomplete_details,
                                     "usage": usage_value
                                 });
+                                // Use the canonical Responses shape (including
+                                // output_text blocks and object/status fields).
+                                let resp = transform_to_responses_api(&chat_resp);
                                 if debug_logger::is_enabled(&debug_cfg) {
                                     let payload = json!({
                                         "kind": "exchange_summary",
@@ -2695,11 +3278,11 @@ pub async fn handle_completions(
                                 .into_response();
                         }
                         Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response();
+                            error!("[{}] Stream collection error: {}", trace_id, e);
+                            last_error = format!("Stream collection error: {e}");
+                            token_manager.record_failure(&account_id);
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }
@@ -2708,25 +3291,35 @@ pub async fn handle_completions(
             let gemini_resp: Value = match response.json().await {
                 Ok(json) => json,
                 Err(e) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        [("X-Mapped-Model", mapped_model.as_str())],
-                        format!("Parse error: {}", e),
-                    )
-                        .into_response();
+                    last_error = format!("Failed to parse Gemini response: {e}");
+                    token_manager.record_failure(&account_id);
+                    force_rotate = true;
+                    continue;
                 }
             };
+            if let Err(error) =
+                super::common::validate_gemini_terminal_response(&gemini_resp)
+            {
+                last_error = error;
+                token_manager.record_failure(&account_id);
+                force_rotate = true;
+                continue;
+            }
 
-            let chat_resp = transform_openai_response(
+            let mut chat_resp = crate::proxy::mappers::openai::response::transform_openai_response_with_options(
                 &gemini_resp,
                 Some("session-123"),
                 1,
                 Some(&client_tool_names),
+                hide_thinking_output,
             );
+            ensure_openai_usage(&mut chat_resp, fallback_input_tokens);
 
             let is_responses_api = uri.path() == "/v1/responses";
 
             if is_responses_api {
+                let (response_status, incomplete_details) =
+                    responses_terminal_metadata(&chat_resp);
                 let mut output = Vec::new();
                 for c in chat_resp.choices.iter() {
                     let text = match &c.message.content {
@@ -2742,6 +3335,14 @@ pub async fn handle_completions(
                         let mut msg_obj = serde_json::Map::new();
                         msg_obj.insert("type".to_string(), json!("message"));
                         msg_obj.insert("role".to_string(), json!("assistant"));
+                        msg_obj.insert(
+                            "status".to_string(),
+                            json!(if response_status == "completed" {
+                                "completed"
+                            } else {
+                                "incomplete"
+                            }),
+                        );
 
                         if has_content {
                             msg_obj.insert("content".to_string(), json!(text));
@@ -2770,13 +3371,15 @@ pub async fn handle_completions(
                     })
                 };
 
-                let resp = json!({
+                let _legacy_resp = json!({
                     "type": "response",
                     "id": format!("resp_{}", uuid::Uuid::new_v4().simple()),
-                    "status": "completed",
+                    "status": response_status,
                     "output": output,
+                    "incomplete_details": incomplete_details,
                     "usage": usage_value
                 });
+                let resp = transform_to_responses_api(&chat_resp);
                 if debug_logger::is_enabled(&debug_cfg) {
                     let payload = json!({
                         "kind": "exchange_summary",
@@ -3189,15 +3792,15 @@ pub async fn handle_images_generations_internal(
         "natural" => final_prompt.push_str(", (natural lighting, realistic, photorealistic)"),
         _ => {}
     }
+    let final_prompt =
+        crate::proxy::mappers::common_utils::force_image_generation_prompt(&final_prompt);
 
     // 4. 并发发送请求
     // 注意：不再在外部获取 Token，而是移入 Task 内部并在重试时获取
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager.clone();
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS
-        .min(max_pool_size.saturating_add(1))
-        .max(2);
+    let max_attempts = image_max_attempts(max_pool_size);
 
     let mut tasks = Vec::new();
 
@@ -3220,6 +3823,10 @@ pub async fn handle_images_generations_internal(
             let mut force_rotate = false;
 
             for attempt in 0..max_attempts {
+                let _global_permit = match acquire_global_image_permit().await {
+                    Ok(permit) => permit,
+                    Err(error) => return Err(error),
+                };
                 let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
                     .get_token("image_gen", force_rotate, None, &model_to_use)
                     .await
@@ -3234,6 +3841,7 @@ pub async fn handle_images_generations_internal(
                         break;
                     }
                 };
+                let _account_permit = acquire_image_account_permit(&account_id).await;
                 if let Ok(mut g) = attempted_account.lock() {
                     *g = Some(email.clone());
                 }
@@ -3288,24 +3896,22 @@ pub async fn handle_images_generations_internal(
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
 
-                            // 429/500/503: mark limited and rotate to another account
-                            if status_code == 429 || status_code == 503 || status_code == 500 {
+                            if is_retryable_image_error(status_code, &err_text) {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
                                     email,
                                     status_code
                                 );
-                                token_manager
-                                    .mark_rate_limited_async(
-                                        &email,
-                                        status_code,
-                                        None,
-                                        &err_text,
-                                        Some(model_to_use.as_str()),
-                                    )
-                                    .await;
+                                token_manager.mark_image_error_fast_with_body(
+                                    &account_id,
+                                    status_code,
+                                    Some(model_to_use.as_str()),
+                                    Some(&err_text),
+                                );
                                 force_rotate = true;
-                                continue; // Retry loop
+                                if attempt < max_attempts - 1 {
+                                    continue; // Retry loop
+                                }
                             }
 
                             // [FIX] 403/404 usually mean THIS account lacks the image model or
@@ -3326,7 +3932,8 @@ pub async fn handle_images_generations_internal(
                             // Other errors: return
                             return Err(last_error);
                         }
-                        token_manager.mark_account_success(&account_id);
+                        token_manager
+                            .mark_account_success_for_model(&account_id, Some(&model_to_use));
                         token_manager
                             .clear_persisted_live_limit(&account_id, Some(&model_to_use))
                             .await;
@@ -3338,6 +3945,7 @@ pub async fn handle_images_generations_internal(
                     }
                     Err(e) => {
                         last_error = format!("Network error: {}", e);
+                        force_rotate = true;
                         continue;
                     }
                 }
@@ -3614,6 +4222,8 @@ pub async fn handle_images_edits(
     if let Some(s) = style {
         final_prompt.push_str(&format!(", style: {}", s));
     }
+    let final_prompt =
+        crate::proxy::mappers::common_utils::force_image_generation_prompt(&final_prompt);
     contents_parts.push(json!({
         "text": final_prompt
     }));
@@ -3653,9 +4263,7 @@ pub async fn handle_images_edits(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager.clone();
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS
-        .min(max_pool_size.saturating_add(1))
-        .max(2);
+    let max_attempts = image_max_attempts(max_pool_size);
 
     let mut tasks = Vec::new();
     for _ in 0..n {
@@ -3672,9 +4280,13 @@ pub async fn handle_images_edits(
             let mut force_rotate = false;
 
             for attempt in 0..max_attempts {
+                let _global_permit = match acquire_global_image_permit().await {
+                    Ok(permit) => permit,
+                    Err(error) => return Err(error),
+                };
                 // 4.1 获取 Token
                 let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-                    .get_token("image_gen", force_rotate, None, "gemini-3-pro-image")
+                    .get_token("image_gen", force_rotate, None, &model_to_use)
                     .await
                 {
                     Ok(t) => t,
@@ -3687,12 +4299,17 @@ pub async fn handle_images_edits(
                         break;
                     }
                 };
+                let _account_permit = acquire_image_account_permit(&account_id).await;
+
+                let resolved_model = token_manager
+                    .resolve_dynamic_model_for_account(&account_id, &model_to_use)
+                    .await;
 
                 // 4.2 Construct Request Body (Need project_id)
                 let gemini_body = json!({
                     "project": project_id,
                     "requestId": format!("img-edit-{}", uuid::Uuid::new_v4()),
-                    "model": model_to_use,
+                    "model": resolved_model,
                     "userAgent": "antigravity",
                     "requestType": "image_gen",
                     "request": {
@@ -3736,27 +4353,27 @@ pub async fn handle_images_edits(
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
 
-                            // 429/500/503 等错误进行标记和重试
-                            if status_code == 429 || status_code == 503 || status_code == 500 {
+                            if is_retryable_image_error(status_code, &err_text) {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
                                     email,
                                     status_code
                                 );
-                                token_manager
-                                    .mark_rate_limited_async(
-                                        &email,
-                                        status_code,
-                                        None,
-                                        &err_text,
-                                        Some(&model_to_use),
-                                    )
-                                    .await;
-                                continue; // Retry loop
+                                token_manager.mark_image_error_fast_with_body(
+                                    &account_id,
+                                    status_code,
+                                    Some(&model_to_use),
+                                    Some(&err_text),
+                                );
+                                force_rotate = true;
+                                if attempt < max_attempts - 1 {
+                                    continue; // Retry loop
+                                }
                             }
                             return Err(last_error);
                         }
-                        token_manager.mark_account_success(&account_id);
+                        token_manager
+                            .mark_account_success_for_model(&account_id, Some(&model_to_use));
                         token_manager
                             .clear_persisted_live_limit(&account_id, Some(&model_to_use))
                             .await;
@@ -3768,6 +4385,7 @@ pub async fn handle_images_edits(
                     }
                     Err(e) => {
                         last_error = format!("Network error: {}", e);
+                        force_rotate = true;
                         continue;
                     }
                 }
@@ -4128,10 +4746,10 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
                 let line_raw = buffer.split_to(pos + 1);
                 if let Ok(line_str) = std::str::from_utf8(&line_raw) {
                     let line = line_str.trim();
-                    if line.is_empty() || !line.starts_with("data: ") {
+                    if line.is_empty() || line.strip_prefix("data:").is_none() {
                         continue;
                     }
-                    let json_part = line.trim_start_matches("data: ").trim();
+                    let json_part = line.strip_prefix("data:").map(str::trim).unwrap_or_default();
                     if json_part == "[DONE]" {
                         break;
                     }
@@ -4151,8 +4769,7 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
         if !buffer.is_empty() {
             if let Ok(line_str) = std::str::from_utf8(&buffer) {
                 let line = line_str.trim();
-                if line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
+                if let Some(json_part) = line.strip_prefix("data:").map(str::trim) {
                     if json_part != "[DONE]" {
                         if let Ok(chunk_json) = serde_json::from_str::<Value>(json_part) {
                             translate_openai_chunk_to_ws(

@@ -807,6 +807,10 @@
       "experimental": {
         "title": "实验性设置 (Experimental)",
         "title_tooltip": "探索性功能，可能在未来版本中调整或移除。",
+        "hide_thinking_output": "隐藏思维过程",
+        "hide_thinking_output_tooltip": "隐藏可见思维文本，同时保留签名、工具调用、用量和终态信息。",
+        "direct_non_stream": "非流式请求直接透传",
+        "direct_non_stream_tooltip": "stream=false 时直接调用上游非流式接口；默认关闭以保留严格的流式校验。",
         "enable_usage_scaling": "启用用量缩放",
         "enable_usage_scaling_tooltip": "支持所有兼容协议 (Claude/OpenAI/Gemini)。当总输入超过 30k Token 时开启激进缩放与分阶段上下文去噪提纯，防止在大上下文下频繁触发客户端压缩。注意：开启后客户端显示的用量不再代表实际计费点数。",
         "compression_level_label": "智能上下文压缩等级",

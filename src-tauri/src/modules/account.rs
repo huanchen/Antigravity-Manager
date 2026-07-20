@@ -1495,40 +1495,52 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     // --- Quota protection logic start ---
     if let Ok(config) = crate::modules::config::load_app_config() {
         if config.quota_protection.enabled {
+            let reconciled =
+                crate::proxy::common::model_mapping::reconcile_quota_protection_markers(
+                    &account.protected_models,
+                    &config.quota_protection.monitored_models,
+                );
+            if reconciled != account.protected_models {
+                crate::modules::logger::log_info(&format!(
+                    "[Quota] Reconciled stale protection markers for {}",
+                    account.email
+                ));
+                account.protected_models = reconciled;
+            }
+
             if let Some(ref q) = account.quota {
                 let threshold = config.quota_protection.threshold_percentage as i32;
 
                 let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
 
                 for model in &q.models {
-                    if let Some(std_id) =
-                        crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
-                    {
-                        let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                        if model.percentage > *entry {
-                            *entry = model.percentage;
-                        }
-                    }
+                    crate::proxy::common::model_mapping::merge_standard_quota_max(
+                        &mut group_max_percentage,
+                        &model.name,
+                        model.percentage,
+                    );
                 }
 
-                for std_id in &config.quota_protection.monitored_models {
-                    let max_pct = group_max_percentage.get(std_id).cloned().unwrap_or(100);
+                for configured_model in &config.quota_protection.monitored_models {
+                    for std_id in crate::proxy::common::model_mapping::quota_protection_targets(
+                        configured_model,
+                    ) {
+                        let max_pct = group_max_percentage.get(&std_id).cloned().unwrap_or(100);
 
-                    if max_pct < threshold {
-                        if !account.protected_models.contains(std_id) {
-                            crate::modules::logger::log_info(&format!(
-                                "[Quota] Triggering model protection: {} (Group: {} Max: {}% < Thres: {}%)",
-                                account.email, std_id, max_pct, threshold
-                            ));
-                            account.protected_models.insert(std_id.clone());
-                        }
-                    } else {
-                        if account.protected_models.contains(std_id) {
+                        if max_pct < threshold {
+                            if !account.protected_models.contains(&std_id) {
+                                crate::modules::logger::log_info(&format!(
+                                    "[Quota] Triggering model protection: {} (Group: {} Max: {}% < Thres: {}%)",
+                                    account.email, std_id, max_pct, threshold
+                                ));
+                                account.protected_models.insert(std_id.clone());
+                            }
+                        } else if account.protected_models.contains(&std_id) {
                             crate::modules::logger::log_info(&format!(
                                 "[Quota] Model protection recovered: {} (Group: {} Max: {}% >= Thres: {}%)",
                                 account.email, std_id, max_pct, threshold
                             ));
-                            account.protected_models.remove(std_id);
+                            account.protected_models.remove(&std_id);
                         }
                     }
                 }

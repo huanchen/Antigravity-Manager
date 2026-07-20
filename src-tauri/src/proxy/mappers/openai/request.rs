@@ -201,6 +201,9 @@ pub fn transform_openai_request(
         .map(|list| list.iter().map(|v| v.clone()).collect::<Vec<_>>());
 
     let mapped_model_lower = mapped_model.to_lowercase();
+    let request_model_lower = request.model.to_lowercase();
+    let explicitly_thinking_variant = mapped_model_lower.contains("-thinking")
+        || request_model_lower.contains("-thinking");
 
     // Resolve grounding config
     let config = crate::proxy::mappers::common_utils::resolve_request_config(
@@ -212,7 +215,6 @@ pub fn transform_openai_request(
         request.image_size.as_deref(), // [FIX] Pass imageSize parameter
         None,                          // body
     );
-
     // [FIX] 仅当模型名称显式包含 "-thinking" 时才视为 Gemini 思维模型
     // 避免对 gemini-3-pro (preview) 等其实不支持 thinkingConfig 的模型注入参数导致 400
     // [FIX #1557] Allow "pro" models (e.g. gemini-3-pro, gemini-2.0-pro) to bypass thinking check
@@ -232,14 +234,19 @@ pub fn transform_openai_request(
             || mapped_model_lower.contains("-flash-")
             || mapped_model_lower.contains("-flash-agent"))
         && !mapped_model_lower.contains("claude");
-    let is_claude_thinking = mapped_model_lower.ends_with("-thinking");
+    let is_claude_thinking = mapped_model_lower.ends_with("-thinking")
+        || (request_model_lower.contains("claude") && explicitly_thinking_variant);
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
 
     // [NEW] 检查用户是否在请求中显式启用 thinking
     let user_enabled_thinking = request
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type.as_deref() == Some("enabled"))
+        .map(|t| {
+            matches!(t.thinking_type.as_deref(), Some("enabled" | "adaptive"))
+                || t.budget_tokens.is_some_and(|budget| budget > 0)
+                || t.effort.is_some()
+        })
         .unwrap_or(false);
     let user_thinking_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
 
@@ -599,7 +606,7 @@ pub fn transform_openai_request(
                     if let Some(ref sig) = thought_sig {
                         func_call_part["thoughtSignature"] = json!(sig);
                         func_call_part["thought_signature"] = json!(sig);
-                    } else if is_thinking_model || is_gemini_flash_thinking {
+                    } else if actual_include_thinking || is_gemini_flash_thinking {
                         // [NEW] Handle missing signature for Gemini thinking models
                         // [FIX #1650] Allow sentinel injection for Vertex AI (projects/...) as well
                         // [FIX #2167] Also applies to gemini-3-flash / gemini-3.1-flash
@@ -714,13 +721,12 @@ pub fn transform_openai_request(
         "topK": 40,
     });
 
-    // [FIX] 移除旧的硬编码限额，改为动态查询 (v4.1.29)
+    // Leave an omitted caller limit omitted. The upstream model default is
+    // safer than manufacturing a large cap for plain requests; thinking models
+    // receive an explicit cap below only when they need one to satisfy the
+    // Gemini thinking-budget constraint.
     if let Some(max_tokens) = request.max_tokens {
-        gen_config["maxOutputTokens"] = json!(max_tokens);
-    } else {
-        // 使用动态优先的规格限额
-        let limit = model_specs::get_max_output_tokens(mapped_model, token);
-        gen_config["maxOutputTokens"] = json!(limit);
+        gen_config["maxOutputTokens"] = json!(max_tokens.max(1));
     }
 
     // [NEW] 支持多候选结果数量 (n -> candidateCount)
@@ -799,8 +805,10 @@ pub fn transform_openai_request(
                 "thinkingBudget": final_budget
             });
 
-            // [CRITICAL] 思维模型的 maxOutputTokens 必须大于 thinkingBudget
-            // [FIX #1675] 针对图像模型使用更保守的 max_tokens 增量，避免触发 128k 限制
+            // Gemini requires maxOutputTokens to remain above a positive
+            // thinking budget. Preserve the upstream v4.4.6 behavior for small
+            // caller limits: reserve a minimum visible-output allowance instead
+            // of emitting an unsupported zero budget or starving the answer.
             let overhead = if config.request_type == "image_gen" {
                 2048
             } else {
@@ -811,19 +819,21 @@ pub fn transform_openai_request(
             } else {
                 8192
             };
+            let model_cap = model_specs::get_max_output_tokens(mapped_model, token) as i64;
 
             if model_lower.contains("claude-opus-4-6-thinking") {
-                gen_config["maxOutputTokens"] = json!(57344);
+                gen_config["maxOutputTokens"] = json!(57344_i64.min(model_cap));
                 tracing::debug!(
                     "[Opus-Alignment] Enforcing maxOutputTokens 57344 for Opus 4.6 (OpenAI)"
                 );
             } else if let Some(max_tokens) = request.max_tokens {
-                if (max_tokens as i64) <= final_budget {
-                    gen_config["maxOutputTokens"] = json!(final_budget + min_overhead);
+                if i64::from(max_tokens) <= final_budget {
+                    let required = final_budget.saturating_add(min_overhead);
+                    gen_config["maxOutputTokens"] = json!(required.min(model_cap));
                 }
             } else {
-                // [FIX #1592] Use a more conservative default to avoid 400 error on 128k context models
-                gen_config["maxOutputTokens"] = json!(final_budget + overhead);
+                let required = final_budget.saturating_add(overhead);
+                gen_config["maxOutputTokens"] = json!(required.min(model_cap));
             }
 
             let new_max = gen_config["maxOutputTokens"].as_i64().unwrap_or(0);
@@ -843,11 +853,12 @@ pub fn transform_openai_request(
     // [FIX] Cap maxOutputTokens to prevent 400 Invalid Argument
     if let Some(val) = gen_config["maxOutputTokens"].as_i64() {
         let model_lower = mapped_model.to_lowercase();
-        let safe_limit = if model_lower.contains("claude") {
+        let protocol_limit = if model_lower.contains("claude") {
             64000
         } else {
             65536
         };
+        let safe_limit = protocol_limit.min(model_specs::get_max_output_tokens(mapped_model, token) as i64);
         if val > safe_limit {
             tracing::warn!(
                 "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
@@ -1296,7 +1307,6 @@ mod tests {
     use crate::proxy::mappers::openai::models::*;
 
     #[test]
-    #[test]
     fn test_issue_1592_gemini_3_pro_budget_capping() {
         // [FIX #1592] Regression test for gemini-3-pro thinking budget capping
         let req = OpenAIRequest {
@@ -1640,7 +1650,7 @@ mod tests {
             transform_openai_request(&req, "test-v", mapped_model, None);
 
         // Extract the tool call part from contents
-        let contents = result["contents"].as_array().unwrap();
+        let contents = result["request"]["contents"].as_array().unwrap();
         // Identify the part with functionCall
         let parts = contents[0]["parts"].as_array().unwrap();
         let tool_part = parts
@@ -1748,8 +1758,9 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_tools_injection_openai() {
-        // 验证 OpenAI 协议在 Gemini 2.0+ 下支持混合工具
+    fn test_search_is_skipped_when_openai_request_has_function_tools() {
+        // v1internal does not support googleSearch and functionDeclarations together.
+        // Preserve client functions and skip search injection to avoid an upstream 400.
         let req = OpenAIRequest {
             model: "gpt-4o-online".to_string(), // -online 触发联网
             messages: vec![OpenAIMessage {
@@ -1792,8 +1803,8 @@ mod tests {
 
         assert!(has_functions, "Should contain functionDeclarations");
         assert!(
-            has_google_search,
-            "Should contain googleSearch (Gemini 2.0+ supports mixed tools)"
+            !has_google_search,
+            "Should skip googleSearch when functionDeclarations are present"
         );
     }
 }
