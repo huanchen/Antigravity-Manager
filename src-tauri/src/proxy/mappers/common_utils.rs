@@ -444,6 +444,58 @@ pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
     }
 }
 
+/// Gemini requires this flag when built-in tools and function declarations
+/// are present in the same request. Without it v1internal rejects the request
+/// before generation with INVALID_ARGUMENT, which also leaves usage at 0/0.
+pub fn ensure_server_side_tool_invocations(body: &mut Value) -> bool {
+    let Some(request) = body.as_object_mut() else {
+        return false;
+    };
+
+    let Some(tools) = request.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+
+    let has_functions = tools.iter().any(|tool| {
+        tool.as_object()
+            .is_some_and(|object| object.contains_key("functionDeclarations"))
+    });
+    let has_builtin = tools.iter().any(|tool| {
+        tool.as_object().is_some_and(|object| {
+            [
+                "googleSearch",
+                "googleSearchRetrieval",
+                "codeExecution",
+                "urlContext",
+                "enterpriseWebSearch",
+            ]
+            .iter()
+            .any(|key| object.contains_key(*key))
+        })
+    });
+
+    if !has_functions || !has_builtin {
+        return false;
+    }
+
+    if request.get("toolConfig").is_none() {
+        if let Some(tool_config) = request.remove("tool_config") {
+            request.insert("toolConfig".to_string(), tool_config);
+        }
+    } else {
+        request.remove("tool_config");
+    }
+
+    let tool_config = request
+        .entry("toolConfig".to_string())
+        .or_insert_with(|| json!({}));
+    if !tool_config.is_object() {
+        *tool_config = json!({});
+    }
+    tool_config["includeServerSideToolInvocations"] = json!(true);
+    true
+}
+
 /// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败
 pub fn deep_clean_undefined(value: &mut Value, depth: usize) {
     if depth > 10 {

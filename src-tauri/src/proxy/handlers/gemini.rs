@@ -922,7 +922,7 @@ pub async fn handle_generate(
                     let body = Body::from_stream(stream);
                     return Ok(Response::builder()
                         .header("Content-Type", "text/event-stream")
-                        .header("Cache-Control", "no-cache")
+                        .header("Cache-Control", "no-cache, no-transform")
                         .header("Connection", "keep-alive")
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)

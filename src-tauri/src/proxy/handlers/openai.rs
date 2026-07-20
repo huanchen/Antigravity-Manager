@@ -1323,7 +1323,7 @@ pub async fn handle_chat_completions(
                     let body = Body::from_stream(combined_stream);
                     return Ok(Response::builder()
                         .header("Content-Type", "text/event-stream")
-                        .header("Cache-Control", "no-cache")
+                        .header("Cache-Control", "no-cache, no-transform")
                         .header("Connection", "keep-alive")
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
@@ -3003,7 +3003,7 @@ pub async fn handle_completions(
                     }
                     return Response::builder()
                         .header("Content-Type", "text/event-stream")
-                        .header("Cache-Control", "no-cache")
+                        .header("Cache-Control", "no-cache, no-transform")
                         .header("Connection", "keep-alive")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
@@ -3676,7 +3676,7 @@ async fn intercept_chat_to_image(
                 let body = Body::from(sse_data);
                 Ok(Response::builder()
                     .header("Content-Type", "text/event-stream")
-                    .header("Cache-Control", "no-cache")
+                    .header("Cache-Control", "no-cache, no-transform")
                     .header("X-Account-Email", email)
                     .body(body)
                     .unwrap())

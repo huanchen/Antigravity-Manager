@@ -651,6 +651,10 @@ pub fn transform_claude_request_in(
         );
     }
 
+    crate::proxy::mappers::common_utils::ensure_server_side_tool_invocations(
+        &mut inner_request,
+    );
+
     // Inject imageConfig if present (for image generation models)
     if let Some(image_config) = config.image_config {
         if let Some(obj) = inner_request.as_object_mut() {

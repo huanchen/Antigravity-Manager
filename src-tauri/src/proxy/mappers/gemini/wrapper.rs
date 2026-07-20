@@ -897,6 +897,10 @@ pub fn wrap_request_v2(
         });
     }
 
+    crate::proxy::mappers::common_utils::ensure_server_side_tool_invocations(
+        &mut inner_request,
+    );
+
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
     if let Some(account_id_str) = account_id {
         inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
@@ -1970,6 +1974,35 @@ mod tests {
             !has_google_search,
             "Should NOT contain googleSearch due to functionDeclarations presence (v1internal limit)"
         );
+    }
+
+    #[test]
+    fn mixed_builtin_and_function_tools_enable_server_side_invocations() {
+        let body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "Search and call a tool"}]}],
+            "tools": [
+                {"functionDeclarations": [{
+                    "name": "get_weather",
+                    "parameters": {"type": "OBJECT", "properties": {}}
+                }]},
+                {"googleSearch": {}}
+            ],
+            "toolConfig": {
+                "functionCallingConfig": {"mode": "VALIDATED"}
+            }
+        });
+
+        let result = wrap_request(
+            &body,
+            "test-proj",
+            "gemini-3.1-pro-low",
+            None,
+            None,
+            None,
+        );
+        let tool_config = &result["request"]["toolConfig"];
+        assert_eq!(tool_config["includeServerSideToolInvocations"], true);
+        assert_eq!(tool_config["functionCallingConfig"]["mode"], "VALIDATED");
     }
 
     #[test]
