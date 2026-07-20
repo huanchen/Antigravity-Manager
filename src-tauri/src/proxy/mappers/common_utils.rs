@@ -1,6 +1,7 @@
 // Common utilities for request mapping across all protocols
 // Provides unified grounding/networking logic
 
+use base64::Engine;
 use serde_json::{json, Value};
 
 /// Request configuration after grounding resolution
@@ -456,23 +457,36 @@ pub fn ensure_server_side_tool_invocations(body: &mut Value) -> bool {
         return false;
     };
 
-    let has_functions = tools.iter().any(|tool| {
-        tool.as_object()
-            .is_some_and(|object| object.contains_key("functionDeclarations"))
-    });
-    let has_builtin = tools.iter().any(|tool| {
-        tool.as_object().is_some_and(|object| {
-            [
-                "googleSearch",
-                "googleSearchRetrieval",
-                "codeExecution",
-                "urlContext",
-                "enterpriseWebSearch",
-            ]
-            .iter()
-            .any(|key| object.contains_key(*key))
-        })
-    });
+    fn contains_key_recursive(value: &Value, keys: &[&str]) -> bool {
+        match value {
+            Value::Object(object) => object.iter().any(|(key, child)| {
+                keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate))
+                    || contains_key_recursive(child, keys)
+            }),
+            Value::Array(values) => values.iter().any(|child| contains_key_recursive(child, keys)),
+            _ => false,
+        }
+    }
+
+    let has_functions = contains_key_recursive(
+        &Value::Array(tools.clone()),
+        &["functionDeclarations", "function_declarations"],
+    );
+    let has_builtin = contains_key_recursive(
+        &Value::Array(tools.clone()),
+        &[
+            "googleSearch",
+            "google_search",
+            "googleSearchRetrieval",
+            "google_search_retrieval",
+            "codeExecution",
+            "code_execution",
+            "urlContext",
+            "url_context",
+            "enterpriseWebSearch",
+            "enterprise_web_search",
+        ],
+    );
 
     if !has_functions || !has_builtin {
         return false;
@@ -494,6 +508,38 @@ pub fn ensure_server_side_tool_invocations(body: &mut Value) -> bool {
     }
     tool_config["includeServerSideToolInvocations"] = json!(true);
     true
+}
+
+/// Reject malformed inline video before it reaches Gemini, whose upstream error
+/// is otherwise an opaque INVALID_ARGUMENT with 0 frames and usage 0/0.
+pub fn validate_inline_video_parts(body: &Value) -> Result<(), String> {
+    fn walk(value: &Value) -> Result<(), String> {
+        match value {
+            Value::Object(object) => {
+                if let Some(inline) = object.get("inlineData").or_else(|| object.get("inline_data")) {
+                    let mime = inline.get("mimeType").or_else(|| inline.get("mime_type"))
+                        .and_then(Value::as_str).unwrap_or("");
+                    if mime.starts_with("video/") {
+                        let data = inline.get("data").and_then(Value::as_str).unwrap_or("");
+                        if data.is_empty() {
+                            return Err("Video inlineData is empty".to_string());
+                        }
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|_| "Video inlineData is not valid base64".to_string())?;
+                        if decoded.is_empty() {
+                            return Err("Video inlineData contains no bytes".to_string());
+                        }
+                    }
+                }
+                for child in object.values() { walk(child)?; }
+            }
+            Value::Array(values) => for child in values { walk(child)?; },
+            _ => {}
+        }
+        Ok(())
+    }
+    walk(body)
 }
 
 /// 深度迭代清理客户端发送的 [undefined] 脏字符串，防止 Gemini 接口校验失败

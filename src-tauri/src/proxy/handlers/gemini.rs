@@ -415,6 +415,10 @@ pub async fn handle_generate(
     headers: HeaderMap,          // [NEW] Extract headers for adapter detection
     Json(mut body): Json<Value>, // 改为 mut 以支持修复提示词注入
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Err(error) = crate::proxy::mappers::common_utils::validate_inline_video_parts(&body) {
+        return Err((StatusCode::BAD_REQUEST, error));
+    }
+
     // 解析 model:method
     let (model_name, method) = if let Some((m, action)) = model_action.rsplit_once(':') {
         (m.to_string(), action.to_string())
