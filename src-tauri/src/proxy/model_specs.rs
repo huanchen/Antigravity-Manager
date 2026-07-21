@@ -72,6 +72,9 @@ pub fn get_thinking_budget(model_id: &str, _token: Option<&ProxyToken>) -> u64 {
     }
 
     // 3. 默认安全限额
+    // NOTE: also acts as the CAP for client-requested budgets on un-specced models;
+    // 24576 is Google's documented thinking-budget max for several flash models, so
+    // raising this can introduce upstream 400s. Keep conservative.
     24576
 }
 

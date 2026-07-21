@@ -56,6 +56,9 @@ where
         state.set_client_adapter(client_adapter); // [NEW] Set adapter
         state.set_registered_tool_names(registered_tool_names); // [FIX #MCP] Set tool names
         let mut buffer = BytesMut::new();
+        // [TRUNCATION FIX] Track whether an upstream error event was already emitted so
+        // we do not paper over it (or a premature EOF) with a fake message_stop.
+        let mut stream_errored = false;
 
         loop {
             // [NEW] 60秒心跳保活: 延长超时时间以增加网络抖动容错
@@ -93,6 +96,7 @@ where
                                 }
                             });
                             yield Ok(Bytes::from(format!("data: {}\n\n", error_json)));
+                            stream_errored = true;
                             break;
                         }
                     }
@@ -168,6 +172,22 @@ where
             });
 
             yield Ok(state.emit("message_delta", delta));
+        }
+
+        // [TRUNCATION FIX] If the upstream connection ended (EOF or 60s idle timeout)
+        // without ever delivering a finishReason, the response was truncated. Emit a
+        // visible SSE error event instead of silently closing with a clean
+        // message_stop that clients treat as a successful completion.
+        if !state.saw_finish_reason && !stream_errored {
+            tracing::warn!("[{}] Claude stream ended before finishReason; surfacing incomplete_upstream_stream", trace_id);
+            let error_event = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "incomplete_upstream_stream",
+                    "message": "Upstream stream ended before a finish marker"
+                }
+            });
+            yield Ok(state.emit("error", error_event));
         }
 
         // Ensure termination events are sent
@@ -283,6 +303,8 @@ fn process_sse_line(
         .and_then(|cand| cand.get("finishReason"))
         .and_then(|f| f.as_str())
     {
+        // [TRUNCATION FIX] Record that upstream delivered a genuine completion marker.
+        state.saw_finish_reason = true;
         let usage = raw_json
             .get("usageMetadata")
             .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok());
@@ -550,5 +572,91 @@ mod tests {
         // 必须包含模拟的 Usage
         assert!(output.contains("\"usage\":"));
         assert!(output.contains("\"output_tokens\":100")); // Should contain the recovery usage
+    }
+
+    // [TRUNCATION FIX] The terminal Gemini SSE event can arrive without a trailing
+    // newline. Its text, usage and finishReason must survive and the stream must
+    // close cleanly with message_stop (no fake / no truncation error).
+    #[tokio::test]
+    async fn test_claude_stream_flushes_final_event_without_newline() {
+        use futures::StreamExt;
+
+        let final_json = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "final answer" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": { "promptTokenCount": 9, "candidatesTokenCount": 3, "totalTokenCount": 12 },
+            "modelVersion": "gemini-3-flash",
+            "responseId": "msg_tail"
+        });
+        // No trailing "\n\n": the last event is unterminated.
+        let mock_stream = async_stream::stream! {
+            yield Ok::<_, String>(bytes::Bytes::from(format!("data: {}", final_json)));
+        };
+
+        let mut claude_stream = create_claude_sse_stream(
+            Box::pin(mock_stream),
+            "trace_tail".to_string(),
+            "test@example.com".to_string(),
+            None,
+            false,
+            1_000,
+            None,
+            1,
+            None,
+            Vec::new(),
+        );
+
+        let mut output = String::new();
+        while let Some(result) = claude_stream.next().await {
+            if let Ok(bytes) = result {
+                output.push_str(&String::from_utf8(bytes.to_vec()).unwrap());
+            }
+        }
+
+        assert!(output.contains("final answer"), "tail text must survive: {}", output);
+        assert!(output.contains("message_stop"), "clean completion expected");
+        assert!(!output.contains("incomplete_upstream_stream"), "a completed stream is not incomplete");
+    }
+
+    // [TRUNCATION FIX] A premature EOF without any finishReason must surface a visible
+    // error event rather than a silent, clean message_stop.
+    #[tokio::test]
+    async fn test_claude_stream_reports_incomplete_eof() {
+        use futures::StreamExt;
+
+        let partial_json = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "partial" }] } }],
+            "modelVersion": "gemini-3-flash",
+            "responseId": "msg_partial"
+        });
+        let mock_stream = async_stream::stream! {
+            yield Ok::<_, String>(bytes::Bytes::from(format!("data: {}\n\n", partial_json)));
+            // Stream ends with no finishReason.
+        };
+
+        let mut claude_stream = create_claude_sse_stream(
+            Box::pin(mock_stream),
+            "trace_partial".to_string(),
+            "test@example.com".to_string(),
+            None,
+            false,
+            1_000,
+            None,
+            1,
+            None,
+            Vec::new(),
+        );
+
+        let mut output = String::new();
+        while let Some(result) = claude_stream.next().await {
+            if let Ok(bytes) = result {
+                output.push_str(&String::from_utf8(bytes.to_vec()).unwrap());
+            }
+        }
+
+        assert!(output.contains("partial"), "partial text should still be delivered");
+        assert!(output.contains("incomplete_upstream_stream"), "premature EOF must surface an error: {}", output);
     }
 }

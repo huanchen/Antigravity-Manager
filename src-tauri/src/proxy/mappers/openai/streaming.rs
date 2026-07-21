@@ -127,6 +127,235 @@ fn parse_codex_trailing_event(
     Some((texts, usage, saw_marker))
 }
 
+/// Process a single Gemini SSE `data:` line into OpenAI chat.completion.chunk SSE bytes.
+///
+/// Shared by the main read loop and the EOF flush so that a terminal event which
+/// arrives without a trailing newline is parsed identically instead of being dropped.
+/// Sets `saw_completion_marker` when a `usageMetadata` or `finishReason` is observed.
+#[allow(clippy::too_many_arguments)]
+fn build_openai_chat_chunks_from_line(
+    line: &str,
+    stream_id: &str,
+    created_ts: i64,
+    model: &str,
+    session_id: &str,
+    message_count: usize,
+    hide_thinking_output: bool,
+    emitted_tool_calls: &mut std::collections::HashSet<String>,
+    tool_call_index: &mut usize,
+    final_usage: &mut Option<super::models::OpenAIUsage>,
+    saw_completion_marker: &mut bool,
+) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    let line = line.trim();
+    if line.is_empty() || !line.starts_with("data: ") {
+        return out;
+    }
+    let json_part = line.trim_start_matches("data: ").trim();
+    if json_part == "[DONE]" {
+        return out;
+    }
+    let Ok(mut json) = serde_json::from_str::<Value>(json_part) else {
+        return out;
+    };
+    let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+        inner
+    } else {
+        json
+    };
+    if let Some(u) = actual_data.get("usageMetadata") {
+        *final_usage = extract_usage_metadata(u);
+        *saw_completion_marker = true;
+    }
+
+    let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) else {
+        return out;
+    };
+    if !candidates.is_empty() {
+        tracing::debug!("[Stream-Debug] Raw Candidate: {:?}", candidates[0]);
+    }
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let parts = candidate
+            .get("content")
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array());
+        let mut content_out = String::new();
+        let mut thought_out = String::new();
+
+        if let Some(parts_list) = parts {
+            for part in parts_list {
+                let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    if is_thought_part {
+                        if !hide_thinking_output {
+                            thought_out.push_str(text);
+                        }
+                    } else {
+                        content_out.push_str(text);
+                    }
+                }
+                if let Some(sig) = part
+                    .get("thoughtSignature")
+                    .or(part.get("thought_signature"))
+                    .and_then(|s| s.as_str())
+                {
+                    store_thought_signature(sig, session_id, message_count);
+                }
+                if let Some(img) = part.get("inlineData") {
+                    let mime_type = img.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
+                    let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                    if !data.is_empty() {
+                        content_out.push_str(&format!("![image](data:{};base64,{})", mime_type, data));
+                    }
+                }
+                if let Some(func_call) = part.get("functionCall") {
+                    let call_key = serde_json::to_string(func_call).unwrap_or_default();
+                    if !emitted_tool_calls.contains(&call_key) {
+                        emitted_tool_calls.insert(call_key);
+                        let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let mut args = func_call.get("args").unwrap_or(&json!({})).clone();
+
+                        // [FIX #1575] 标准化 shell 工具参数名称
+                        if name == "shell" || name == "bash" || name == "local_shell" {
+                            if let Some(obj) = args.as_object_mut() {
+                                if !obj.contains_key("command") {
+                                    for alt_key in &["cmd", "code", "script", "shell_command"] {
+                                        if let Some(val) = obj.remove(*alt_key) {
+                                            obj.insert("command".to_string(), val);
+                                            debug!("[OpenAI-Stream] Normalized shell arg '{}' -> 'command'", alt_key);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let args_str = serde_json::to_string(&args).unwrap_or_default();
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        use std::hash::{Hash, Hasher};
+                        serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
+                        let call_id = format!("call_{:x}", hasher.finish());
+
+                        let tool_call_chunk = json!({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": model,
+                            "choices": [{
+                                "index": idx as u32,
+                                "delta": {
+                                    "role": "assistant",
+                                    "tool_calls": [{
+                                        "index": *tool_call_index,
+                                        "id": call_id,
+                                        "type": "function",
+                                        "function": { "name": name, "arguments": args_str }
+                                    }]
+                                },
+                                "finish_reason": serde_json::Value::Null
+                            }]
+                        });
+                        *tool_call_index += 1;
+                        out.push(Bytes::from(format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&tool_call_chunk).unwrap_or_default()
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(grounding) = candidate.get("groundingMetadata") {
+            let mut grounding_text = String::new();
+            if let Some(queries) = grounding.get("webSearchQueries").and_then(|q| q.as_array()) {
+                let query_list: Vec<&str> = queries.iter().filter_map(|v| v.as_str()).collect();
+                if !query_list.is_empty() {
+                    grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
+                    grounding_text.push_str(&query_list.join(", "));
+                }
+            }
+            if let Some(chunks) = grounding.get("groundingChunks").and_then(|c| c.as_array()) {
+                let mut links = Vec::new();
+                for (i, chunk) in chunks.iter().enumerate() {
+                    if let Some(web) = chunk.get("web") {
+                        let title = web.get("title").and_then(|v| v.as_str()).unwrap_or("网页来源");
+                        let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
+                        links.push(format!("[{}] [{}]({})", i + 1, title, uri));
+                    }
+                }
+                if !links.is_empty() {
+                    grounding_text.push_str("\n\n**🌐 来源引文：**\n");
+                    grounding_text.push_str(&links.join("\n"));
+                }
+            }
+            if !grounding_text.is_empty() {
+                content_out.push_str(&grounding_text);
+            }
+        }
+
+        let gemini_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str()).map(|f| match f {
+            "STOP" => "stop",
+            "MAX_TOKENS" => "length",
+            "SAFETY" => "content_filter",
+            "RECITATION" => "content_filter",
+            _ => f,
+        });
+        if gemini_finish_reason.is_some() {
+            *saw_completion_marker = true;
+        }
+
+        // [FIX #1575] 如果发射了工具调用，强制设置为 tool_calls
+        let finish_reason = if !emitted_tool_calls.is_empty() && gemini_finish_reason.is_some() {
+            Some("tool_calls")
+        } else {
+            gemini_finish_reason
+        };
+
+        if !thought_out.is_empty() {
+            let reasoning_chunk = json!({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{
+                    "index": idx as u32,
+                    "delta": { "role": "assistant", "content": serde_json::Value::Null, "reasoning_content": thought_out },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            out.push(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&reasoning_chunk).unwrap_or_default()
+            )));
+        }
+
+        if !content_out.is_empty() || finish_reason.is_some() {
+            let mut openai_chunk = json!({
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{
+                    "index": idx as u32,
+                    "delta": { "content": content_out },
+                    "finish_reason": finish_reason
+                }]
+            });
+            if finish_reason.is_some() {
+                if let Some(ref usage) = final_usage {
+                    openai_chunk["usage"] = serde_json::to_value(usage).unwrap();
+                }
+                *final_usage = None;
+            }
+            out.push(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&openai_chunk).unwrap_or_default()
+            )));
+        }
+    }
+    out
+}
+
 pub fn create_openai_sse_stream<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     model: String,
@@ -147,6 +376,7 @@ where
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
         let mut tool_call_index = 0;
+        let mut saw_completion_marker = false;
 
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -162,181 +392,20 @@ where
                                 if let Ok(line_str) = std::str::from_utf8(&line_raw) {
                                     let line = line_str.trim();
                                     if line.is_empty() { continue; }
-                                    if line.starts_with("data: ") {
-                                        let json_part = line.trim_start_matches("data: ").trim();
-                                        if json_part == "[DONE]" { continue; }
-                                        if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                                            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
-                                            if let Some(u) = actual_data.get("usageMetadata") {
-                                                final_usage = extract_usage_metadata(u);
-                                            }
-
-                                            if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
-                                                // [DEBUG] 打印原始 candidate 以排查空回复问题
-                                                if candidates.len() > 0 {
-                                                     tracing::debug!("[Stream-Debug] Raw Candidate: {:?}", candidates[0]);
-                                                }
-                                                for (idx, candidate) in candidates.iter().enumerate() {
-                                                    let parts = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array());
-                                                    let mut content_out = String::new();
-                                                    let mut thought_out = String::new();
-
-                                                    if let Some(parts_list) = parts {
-                                                        for part in parts_list {
-                                                            let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                                if is_thought_part {
-                                                                    if !hide_thinking_output { thought_out.push_str(text); }
-                                                                } else { content_out.push_str(text); }
-                                                            }
-                                                            if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
-                                                                store_thought_signature(sig, &session_id, message_count);
-                                                            }
-                                                            if let Some(img) = part.get("inlineData") {
-                                                                let mime_type = img.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
-                                                                let data = img.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                                                                if !data.is_empty() {
-                                                                    content_out.push_str(&format!("![image](data:{};base64,{})", mime_type, data));
-                                                                }
-                                                            }
-                                                            if let Some(func_call) = part.get("functionCall") {
-                                                                let call_key = serde_json::to_string(func_call).unwrap_or_default();
-                                                                if !emitted_tool_calls.contains(&call_key) {
-                                                                    emitted_tool_calls.insert(call_key);
-                                                                    let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                                                    let mut args = func_call.get("args").unwrap_or(&json!({})).clone();
-
-                                                                    // [FIX #1575] 标准化 shell 工具参数名称
-                                                                    // Gemini 可能使用 cmd/code/script 等替代参数名，统一为 command
-                                                                    if name == "shell" || name == "bash" || name == "local_shell" {
-                                                                        if let Some(obj) = args.as_object_mut() {
-                                                                            if !obj.contains_key("command") {
-                                                                                for alt_key in &["cmd", "code", "script", "shell_command"] {
-                                                                                    if let Some(val) = obj.remove(*alt_key) {
-                                                                                        obj.insert("command".to_string(), val);
-                                                                                        debug!("[OpenAI-Stream] Normalized shell arg '{}' -> 'command'", alt_key);
-                                                                                        break;
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-
-                                                                    let args_str = serde_json::to_string(&args).unwrap_or_default();
-                                                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                                                    use std::hash::{Hash, Hasher};
-                                                                    serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
-                                                                    let call_id = format!("call_{:x}", hasher.finish());
-
-                                                                    let tool_call_chunk = json!({
-                                                                        "id": &stream_id,
-                                                                        "object": "chat.completion.chunk",
-                                                                        "created": created_ts,
-                                                                        "model": &model,
-                                                                        "choices": [{
-                                                                            "index": idx as u32,
-                                                                            "delta": {
-                                                                                "role": "assistant",
-                                                                                "tool_calls": [{
-                                                                                    "index": tool_call_index,
-                                                                                    "id": call_id,
-                                                                                    "type": "function",
-                                                                                    "function": { "name": name, "arguments": args_str }
-                                                                                }]
-                                                                            },
-                                                                            "finish_reason": serde_json::Value::Null
-                                                                        }]
-                                                                    });
-                                                                    tool_call_index += 1;
-                                                                    let sse_out = format!("data: {}\n\n", serde_json::to_string(&tool_call_chunk).unwrap_or_default());
-                                                                    yield Ok::<Bytes, String>(Bytes::from(sse_out));
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-
-                                                    if let Some(grounding) = candidate.get("groundingMetadata") {
-                                                        let mut grounding_text = String::new();
-                                                        if let Some(queries) = grounding.get("webSearchQueries").and_then(|q| q.as_array()) {
-                                                            let query_list: Vec<&str> = queries.iter().filter_map(|v| v.as_str()).collect();
-                                                            if !query_list.is_empty() {
-                                                                grounding_text.push_str("\n\n---\n**🔍 已为您搜索：** ");
-                                                                grounding_text.push_str(&query_list.join(", "));
-                                                            }
-                                                        }
-                                                        if let Some(chunks) = grounding.get("groundingChunks").and_then(|c| c.as_array()) {
-                                                            let mut links = Vec::new();
-                                                            for (i, chunk) in chunks.iter().enumerate() {
-                                                                if let Some(web) = chunk.get("web") {
-                                                                    let title = web.get("title").and_then(|v| v.as_str()).unwrap_or("网页来源");
-                                                                    let uri = web.get("uri").and_then(|v| v.as_str()).unwrap_or("#");
-                                                                    links.push(format!("[{}] [{}]({})", i + 1, title, uri));
-                                                                }
-                                                            }
-                                                            if !links.is_empty() {
-                                                                grounding_text.push_str("\n\n**🌐 来源引文：**\n");
-                                                                grounding_text.push_str(&links.join("\n"));
-                                                            }
-                                                        }
-                                                        if !grounding_text.is_empty() { content_out.push_str(&grounding_text); }
-                                                    }
-
-                                                    let gemini_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str()).map(|f| match f {
-                                                        "STOP" => "stop",
-                                                        "MAX_TOKENS" => "length",
-                                                        "SAFETY" => "content_filter",
-                                                        "RECITATION" => "content_filter",
-                                                        _ => f,
-                                                    });
-
-                                                    // [FIX #1575] 如果发射了工具调用，强制设置为 tool_calls
-                                                    // 解决 Gemini 返回 STOP 但有工具调用时，OpenAI 客户端认为对话已结束的问题
-                                                    let finish_reason = if !emitted_tool_calls.is_empty() && gemini_finish_reason.is_some() {
-                                                        Some("tool_calls")
-                                                    } else {
-                                                        gemini_finish_reason
-                                                    };
-
-                                                    if !thought_out.is_empty() {
-                                                        let reasoning_chunk = json!({
-                                                            "id": &stream_id,
-                                                            "object": "chat.completion.chunk",
-                                                            "created": created_ts,
-                                                            "model": &model,
-                                                            "choices": [{
-                                                                "index": idx as u32,
-                                                                "delta": { "role": "assistant", "content": serde_json::Value::Null, "reasoning_content": thought_out },
-                                                                "finish_reason": serde_json::Value::Null
-                                                            }]
-                                                        });
-                                                        let sse_out = format!("data: {}\n\n", serde_json::to_string(&reasoning_chunk).unwrap_or_default());
-                                                        yield Ok::<Bytes, String>(Bytes::from(sse_out));
-                                                    }
-
-                                                    if !content_out.is_empty() || finish_reason.is_some() {
-                                                        let mut openai_chunk = json!({
-                                                            "id": &stream_id,
-                                                            "object": "chat.completion.chunk",
-                                                            "created": created_ts,
-                                                            "model": &model,
-                                                            "choices": [{
-                                                                "index": idx as u32,
-                                                                "delta": { "content": content_out },
-                                                                "finish_reason": finish_reason
-                                                            }]
-                                                        });
-                                                        if finish_reason.is_some() {
-                                                            if let Some(ref usage) = final_usage {
-                                                                openai_chunk["usage"] = serde_json::to_value(usage).unwrap();
-                                                            }
-                                                        }
-                                                        if finish_reason.is_some() { final_usage = None; }
-                                                        let sse_out = format!("data: {}\n\n", serde_json::to_string(&openai_chunk).unwrap_or_default());
-                                                        yield Ok::<Bytes, String>(Bytes::from(sse_out));
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    for chunk in build_openai_chat_chunks_from_line(
+                                        line,
+                                        &stream_id,
+                                        created_ts,
+                                        &model,
+                                        &session_id,
+                                        message_count,
+                                        hide_thinking_output,
+                                        &mut emitted_tool_calls,
+                                        &mut tool_call_index,
+                                        &mut final_usage,
+                                        &mut saw_completion_marker,
+                                    ) {
+                                        yield Ok::<Bytes, String>(chunk);
                                     }
                                 }
                             }
@@ -363,20 +432,54 @@ where
             }
         }
 
-        // [FIX #1732] Flush remaining buffer to prevent hang on network fragmentation
-        if !buffer.is_empty() {
+        // [FIX #1732] Flush remaining buffer to prevent loss of a terminal SSE event
+        // that arrived without a trailing newline (network fragmentation). Previously
+        // this only debug-logged the residual bytes, dropping the last text /
+        // finishReason / usage and silently truncating the response.
+        if !error_occurred && !buffer.is_empty() {
             if let Ok(line_str) = std::str::from_utf8(&buffer) {
                 let line = line_str.trim();
-                if !line.is_empty() && line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part != "[DONE]" {
-                        // Re-use logic for processing the last line
-                        // (Note: In a more complex refactor we'd extract this to a function,
-                        // but for a targeted fix, processing the terminal data chunk is safer)
-                        tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in buffer", buffer.len());
+                if !line.is_empty() {
+                    tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in buffer", buffer.len());
+                    for chunk in build_openai_chat_chunks_from_line(
+                        line,
+                        &stream_id,
+                        created_ts,
+                        &model,
+                        &session_id,
+                        message_count,
+                        hide_thinking_output,
+                        &mut emitted_tool_calls,
+                        &mut tool_call_index,
+                        &mut final_usage,
+                        &mut saw_completion_marker,
+                    ) {
+                        yield Ok::<Bytes, String>(chunk);
                     }
                 }
             }
+        }
+        buffer.clear();
+
+        // Refuse to fake a successful completion. If the upstream connection ended
+        // (EOF or idle timeout) without ever delivering a finishReason / usage
+        // marker, the response was truncated — surface a visible error instead of a
+        // bare [DONE] that clients treat as success.
+        if !error_occurred && !saw_completion_marker {
+            tracing::warn!("[OpenAI-Stream] Upstream ended before finish marker; refusing silent success");
+            let error_chunk = json!({
+                "id": &stream_id,
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": &model,
+                "choices": [],
+                "error": {
+                    "type": "incomplete_upstream_stream",
+                    "message": "Upstream stream ended before a finish marker",
+                    "code": "incomplete_upstream_stream"
+                }
+            });
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
         }
 
         if !error_occurred {
@@ -1031,6 +1134,77 @@ mod tests {
         }
         assert!(found_usage, "Usage should be found in the last chunk");
         assert!(found_finish, "Finish reason should be strictly 'stop'");
+    }
+
+    // [TRUNCATION FIX] The terminal SSE event can arrive without a trailing newline.
+    // The public text, finishReason and usage in that tail packet must survive, the
+    // thought must still be hidden, and the stream must close with [DONE].
+    #[tokio::test]
+    async fn test_openai_stream_flushes_final_event_without_newline() {
+        let chunk = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "hidden reasoning", "thought": true, "thoughtSignature": "sig"},
+                    {"text": "final public text"}
+                ]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 15
+            }
+        });
+        // Note: no trailing "\n\n" — the tail packet is unterminated.
+        let items: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from(format!("data: {}", chunk)))];
+        let mut output = create_openai_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            true,
+        );
+
+        let mut body = String::new();
+        while let Some(item) = output.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+
+        assert!(body.contains("final public text"), "public tail text must survive: {}", body);
+        assert!(!body.contains("hidden reasoning"), "thought must stay hidden");
+        assert!(body.contains("\"finish_reason\":\"stop\""), "finish reason must be present");
+        assert!(body.contains("\"prompt_tokens\":11"), "usage must be present");
+        assert!(body.contains("\"completion_tokens\":4"));
+        assert!(body.contains("data: [DONE]"));
+        assert!(!body.contains("incomplete_upstream_stream"), "a completed stream is not incomplete");
+    }
+
+    // [TRUNCATION FIX] A premature EOF without any finishReason / usage must surface a
+    // visible error instead of a bare [DONE] that clients treat as success.
+    #[tokio::test]
+    async fn test_openai_stream_reports_incomplete_eof() {
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [{"text": "partial answer"}]}}]
+        });
+        let items: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from(format!("data: {}\n\n", chunk)))];
+        let mut output = create_openai_sse_stream(
+            Box::pin(stream::iter(items)),
+            "gemini-3-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            false,
+        );
+
+        let mut body = String::new();
+        while let Some(item) = output.next().await {
+            body.push_str(&String::from_utf8_lossy(&item.unwrap()));
+        }
+
+        assert!(body.contains("partial answer"), "partial content should still be delivered");
+        assert!(body.contains("incomplete_upstream_stream"), "premature EOF must surface an error: {}", body);
+        assert!(!body.contains("\"finish_reason\":\"stop\""), "must not fake a stop finish reason");
     }
 
     #[tokio::test]

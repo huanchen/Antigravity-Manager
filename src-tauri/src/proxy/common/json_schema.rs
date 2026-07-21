@@ -926,6 +926,72 @@ mod tests {
         assert!(req.iter().all(|r| r.as_str() != Some("forbidden")));
     }
     #[test]
+    fn test_drops_deeply_nested_boolean_subschemas() {
+        // Repro of the observed upstream 400: bare `true` boolean sub-schemas nested
+        // several `properties` levels deep (e.g. `...properties[7].value.properties[0]
+        // .value.properties[0].value = true`). Every such leaf must be stripped, and
+        // `additionalProperties: true` must not survive either.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "lvl1": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "lvl2": {
+                            "type": "object",
+                            "properties": {
+                                "lvl3": {
+                                    "type": "object",
+                                    "properties": {
+                                        "boolLeaf": true,
+                                        "keep": { "type": "string" }
+                                    },
+                                    "required": ["boolLeaf", "keep"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        clean_json_schema(&mut schema);
+
+        // Walk down and prove no boolean leaked and additionalProperties is gone.
+        let lvl1 = &schema["properties"]["lvl1"];
+        assert!(
+            lvl1.get("additionalProperties").is_none(),
+            "additionalProperties must be stripped"
+        );
+        let lvl3_props =
+            &schema["properties"]["lvl1"]["properties"]["lvl2"]["properties"]["lvl3"]["properties"];
+        assert!(
+            lvl3_props.get("boolLeaf").is_none(),
+            "deep boolean sub-schema must be dropped"
+        );
+        assert!(lvl3_props["keep"].is_object(), "valid deep sibling must survive");
+
+        // No `true`/`false` scalar may appear anywhere as a property value.
+        fn assert_no_bool_props(v: &Value) {
+            if let Value::Object(m) = v {
+                if let Some(Value::Object(props)) = m.get("properties") {
+                    for (k, pv) in props {
+                        assert!(pv.is_object(), "property {k} must be an object, not a bare scalar");
+                    }
+                }
+                for (_k, cv) in m {
+                    assert_no_bool_props(cv);
+                }
+            } else if let Value::Array(a) = v {
+                for item in a {
+                    assert_no_bool_props(item);
+                }
+            }
+        }
+        assert_no_bool_props(&schema);
+    }
+
+    #[test]
     fn test_clean_json_schema_draft_2020_12() {
         let mut schema = json!({
             "$schema": "http://json-schema.org/draft-07/schema#",

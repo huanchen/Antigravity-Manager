@@ -178,6 +178,33 @@ pub fn wrap_request(
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
 
+    // [FIX] Some clients (observed live: SillyTavern-style frontends) send a part that
+    // is an empty object `{}`. v1internal rejects the whole request with 400
+    // "GenerateContentRequest.contents[N].parts[N].data: required oneof field 'data'
+    // must have one initialized field", which the user sees as an empty reply. Drop
+    // such parts; if a turn loses all its parts, keep it valid with an empty text part.
+    if let Some(contents) = inner_request
+        .get_mut("contents")
+        .and_then(|c| c.as_array_mut())
+    {
+        for content in contents.iter_mut() {
+            if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                let before = parts.len();
+                parts.retain(|p| p.as_object().map_or(false, |o| !o.is_empty()));
+                if parts.len() != before {
+                    tracing::warn!(
+                        "[Gemini-Wrap] Dropped {} empty part(s) from a content turn (avoids v1internal 400)",
+                        before - parts.len()
+                    );
+                }
+                if parts.is_empty() {
+                    // A single space, not "": some Gemini backends also 400 on empty text.
+                    parts.push(json!({"text": " "}));
+                }
+            }
+        }
+    }
+
     // v1internal rejects unknown safety categories instead of ignoring them.
     clean_safety_settings(&mut inner_request);
 
@@ -719,6 +746,42 @@ pub fn wrap_request(
         });
     }
 
+    // [FIX] The cloudcode-pa v1internal endpoint does NOT support mixing a built-in /
+    // server-side tool (googleSearch, googleSearchRetrieval, urlContext,
+    // codeExecution, ...) with functionDeclarations: it rejects the request with 400
+    // "Please enable tool_config.include_server_side_tool_invocations to use Built-in
+    // tools with Function calling." — but this endpoint does not honor that flag
+    // (verified on the wire: setting it in toolConfig still 400s). To keep custom
+    // function calling working (the client's own tools take priority), drop the
+    // built-in tool entries whenever functionDeclarations are present. This mirrors the
+    // guard already in inject_google_search_tool and also removes any built-in tool the
+    // client sent itself or that an earlier injection added.
+    if let Some(tools_arr) = inner_request
+        .get_mut("tools")
+        .and_then(|t| t.as_array_mut())
+    {
+        let has_function = tools_arr.iter().any(|t| {
+            t.as_object()
+                .map_or(false, |o| o.contains_key("functionDeclarations"))
+        });
+        if has_function {
+            let before = tools_arr.len();
+            // Keep only entries that carry functionDeclarations; drop pure built-in
+            // tool entries (googleSearch, googleSearchRetrieval, urlContext,
+            // codeExecution, googleMaps, enterpriseWebSearch, ...).
+            tools_arr.retain(|t| {
+                t.as_object()
+                    .map_or(true, |o| o.contains_key("functionDeclarations"))
+            });
+            if tools_arr.len() != before {
+                tracing::warn!(
+                    "[Gemini-Wrap] Dropped {} built-in tool(s) to avoid v1internal 400 (built-in + functionDeclarations unsupported)",
+                    before - tools_arr.len()
+                );
+            }
+        }
+    }
+
     // [ADDED v4.1.24] 注入基于账号的稳定 sessionId
     if let Some(account_id_str) = account_id {
         inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_id(
@@ -915,6 +978,96 @@ mod tests {
         assert_eq!(result["project"], "test-project");
         assert_eq!(result["model"], "gemini-2.5-flash");
         assert!(result["requestId"].as_str().unwrap().starts_with("agent/"));
+    }
+
+    // [FIX] The cloudcode-pa v1internal endpoint does NOT support mixing a built-in tool
+    // (googleSearch) with functionDeclarations, and does NOT honor
+    // includeServerSideToolInvocations. So when functionDeclarations are present, the
+    // built-in tool entries must be dropped, keeping only the client's own functions.
+    #[test]
+    fn test_wrap_request_drops_builtin_tools_when_mixed_with_functions() {
+        let body = json!({
+            "model": "gemini-3.1-pro",
+            "contents": [{"role": "user", "parts": [{"text": "search and act"}]}],
+            "tools": [
+                {"googleSearch": {}},
+                {"functionDeclarations": [{
+                    "name": "list_files",
+                    "description": "List files.",
+                    "parameters": {"type": "OBJECT", "properties": {"path": {"type": "STRING"}}}
+                }]}
+            ]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-3.1-pro", None, None, None);
+        let tools = result["request"]["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().all(|t| t.get("functionDeclarations").is_some()),
+            "built-in tool entries must be dropped when functionDeclarations are present"
+        );
+        assert!(
+            tools.iter().any(|t| t.get("functionDeclarations").is_some()),
+            "functionDeclarations must be retained"
+        );
+        assert!(
+            tools.iter().all(|t| t.get("googleSearch").is_none()),
+            "googleSearch must not survive alongside functionDeclarations"
+        );
+    }
+
+    // [FIX] Empty part objects `{}` from buggy clients must be dropped, and a turn that
+    // loses all parts must stay valid — otherwise v1internal 400s the whole request
+    // ("required oneof field 'data' must have one initialized field").
+    #[test]
+    fn test_wrap_request_drops_empty_parts() {
+        let body = json!({
+            "model": "gemini-3-flash",
+            "contents": [
+                {"role": "user", "parts": [{}]},
+                {"role": "model", "parts": [{"text": "hi"}, {}]}
+            ]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-3-flash", None, None, None);
+        let contents = result["request"]["contents"].as_array().unwrap();
+
+        // Turn 0: only part was empty -> replaced with a placeholder text part.
+        let turn0_parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(turn0_parts.len(), 1);
+        assert!(turn0_parts[0].get("text").is_some(), "placeholder text part expected");
+
+        // Turn 1: empty part dropped, real part kept.
+        let turn1_parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(turn1_parts.len(), 1);
+        assert_eq!(turn1_parts[0]["text"], "hi");
+    }
+
+    // Function-only requests keep their functionDeclarations untouched (and no built-in
+    // tool is injected for them).
+    #[test]
+    fn test_wrap_request_function_only_tools_preserved() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "act"}]}],
+            "tools": [
+                {"functionDeclarations": [{
+                    "name": "list_files",
+                    "description": "List files.",
+                    "parameters": {"type": "OBJECT", "properties": {}}
+                }]}
+            ]
+        });
+
+        let result = wrap_request(&body, "test-project", "gemini-2.5-flash", None, None, None);
+        let tools = result["request"]["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().any(|t| t.get("functionDeclarations").is_some()),
+            "function-only requests must keep their functionDeclarations"
+        );
+        assert!(
+            tools.iter().all(|t| t.get("googleSearch").is_none()),
+            "no built-in googleSearch should be injected for function-only requests"
+        );
     }
 
     #[test]
@@ -1358,13 +1511,13 @@ mod tests {
                 .get("thinkingConfig")
                 .expect("thinkingConfig should be injected");
 
-            // 3. 验证 Claude 默认预算为 16000
+            // 3. 验证 Claude 默认预算回退到 24576 (get_thinking_budget 的默认安全限额)
             let budget = thinking_config["thinkingBudget"]
                 .as_u64()
                 .expect("thinkingBudget should be a number");
             assert_eq!(
-                budget, 16000,
-                "Claude default thinking budget should be 16000"
+                budget, 24576,
+                "Claude default thinking budget should fall back to 24576"
             );
         }
 
@@ -1481,25 +1634,15 @@ mod tests {
 
     #[test]
     fn test_mixed_tools_injection_gemini_native() {
-        // 验证 Gemini Native 协议在 Gemini 2.0+ 下支持混合工具
+        // The cloudcode-pa v1internal endpoint does NOT support mixing a built-in tool
+        // (googleSearch) with functionDeclarations — it returns 400. So when the client
+        // already supplies functionDeclarations, googleSearch injection must be SKIPPED,
+        // leaving the client's own functions intact.
         let body = json!({
             "contents": [{"parts": [{"text": "Hello"}]}],
             "tools": [{"functionDeclarations": [{"name": "get_weather", "parameters": {"type": "OBJECT", "properties": {"location": {"type": "STRING"}}}}]}],
             "generationConfig": {}
         });
-
-        // 模拟 -online 触发的 RequestConfig
-        use crate::proxy::mappers::common_utils::resolve_request_config;
-        let _config =
-            resolve_request_config("-online", "gemini-2.0-flash", &None, None, None, None, None);
-
-        // 实际上 wrap_request 内部会根据 config.inject_google_search 调用 inject_google_search_tool
-        // 但 wrap_request 的签名不直接接受 RequestConfig，它内部逻辑如下：
-        // if config.inject_google_search { ... }
-
-        // 我们改为直接测试涉及的 wrap_request 逻辑片段。
-        // 由于测试 wrap_request 比较复杂（涉及外部 config），
-        // 我们可以直接验证 inject_google_search_tool 在 native 格式下的表现。
 
         let mut inner_request = body.clone();
         crate::proxy::mappers::common_utils::inject_google_search_tool(
@@ -1515,10 +1658,10 @@ mod tests {
             .any(|t| t.get("functionDeclarations").is_some());
         let has_google_search = tools.iter().any(|t| t.get("googleSearch").is_some());
 
-        assert!(has_functions, "Should contain functionDeclarations");
+        assert!(has_functions, "Should keep functionDeclarations");
         assert!(
-            has_google_search,
-            "Should contain googleSearch (Gemini 2.0+ supports mixed tools)"
+            !has_google_search,
+            "googleSearch must NOT be injected when functionDeclarations are present (v1internal 400)"
         );
     }
 }

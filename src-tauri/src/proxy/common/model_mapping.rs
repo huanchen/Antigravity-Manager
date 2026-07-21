@@ -17,6 +17,28 @@ pub fn update_dynamic_forwarding_rules(old_model: String, new_model: String) {
     DYNAMIC_MODEL_FORWARDING_RULES.insert(old_model, new_model);
 }
 
+/// Apply the official deprecation-forwarding table to a resolved model name.
+///
+/// [FIX] `resolve_model_route` applies `DYNAMIC_MODEL_FORWARDING_RULES` up front, but a
+/// later per-account rewrite (`resolve_dynamic_model_for_account`) can produce a model
+/// ID that is itself deprecated (e.g. `gemini-3.1-pro-high -> gemini-pro-agent`). If
+/// that rewritten name is sent upstream verbatim it triggers a 400 INVALID_ARGUMENT.
+/// Re-run the forwarding table after any post-routing rewrite so the deprecated name is
+/// corrected before the upstream call.
+pub fn apply_dynamic_forwarding(model: &str) -> String {
+    if let Some(forwarded) = DYNAMIC_MODEL_FORWARDING_RULES.get(model) {
+        let target = forwarded.value().clone();
+        if target != model {
+            crate::modules::logger::log_info(&format!(
+                "[Router] 官方淘汰重定向 (post-rewrite): {} -> {}",
+                model, target
+            ));
+        }
+        return target;
+    }
+    model.to_string()
+}
+
 static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
@@ -377,6 +399,25 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // [FIX] A deprecated model ID produced by a post-routing rewrite must be forwarded
+    // to its replacement, mirroring what resolve_model_route does up front. Without this
+    // the deprecated name reaches the upstream and yields 400 INVALID_ARGUMENT.
+    #[test]
+    fn test_apply_dynamic_forwarding() {
+        // Unknown model: passthrough.
+        assert_eq!(apply_dynamic_forwarding("gemini-2.5-flash"), "gemini-2.5-flash");
+
+        // Deprecated model: forwarded to replacement.
+        update_dynamic_forwarding_rules(
+            "gemini-3.1-pro-high".to_string(),
+            "gemini-pro-agent".to_string(),
+        );
+        assert_eq!(
+            apply_dynamic_forwarding("gemini-3.1-pro-high"),
+            "gemini-pro-agent"
+        );
+    }
 
     #[test]
     fn test_model_mapping() {

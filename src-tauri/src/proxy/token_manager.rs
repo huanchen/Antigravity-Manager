@@ -947,7 +947,15 @@ impl TokenManager {
                         candidate
                     );
                 }
-                return candidate;
+                // [FIX] The chosen candidate may itself be a model the upstream has
+                // deprecated (e.g. gemini-3.1-pro-high -> gemini-pro-agent). The
+                // deprecation-forwarding table is applied in resolve_model_route before
+                // account selection, but not to a name produced by this later rewrite.
+                // Re-apply it here so a deprecated ID is never sent upstream (which
+                // returns 400 INVALID_ARGUMENT).
+                return crate::proxy::common::model_mapping::apply_dynamic_forwarding(
+                    &candidate,
+                );
             }
         }
 

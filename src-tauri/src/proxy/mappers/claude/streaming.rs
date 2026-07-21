@@ -234,6 +234,10 @@ pub struct StreamingState {
     pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
     // [FIX #MCP] Registered tool names for fuzzy matching
     pub registered_tool_names: Vec<String>,
+    // [TRUNCATION FIX] Set only when upstream delivers a real finishReason. Used to
+    // distinguish a genuine completion from a premature EOF / idle timeout so we do
+    // not fake a successful message_stop on a truncated stream.
+    pub saw_finish_reason: bool,
 }
 
 impl StreamingState {
@@ -263,6 +267,7 @@ impl StreamingState {
             message_count: 0,
             client_adapter: None,
             registered_tool_names: Vec::new(),
+            saw_finish_reason: false,
         }
     }
 

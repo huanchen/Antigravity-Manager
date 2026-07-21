@@ -982,6 +982,27 @@ pub async fn handle_messages(
             0 // Don't record calibration data when content was purified
         };
 
+        // [FIX] Apply the per-account dynamic rewrite + deprecation forwarding before
+        // baking the model into the upstream body. Unlike the Gemini/OpenAI handlers,
+        // the Claude path builds `config` before account selection and never re-derived
+        // the model per account, so pro-family requests (e.g. gemini-3-pro) were sent
+        // as a system-default name the account does not expose -> upstream 404. Skip
+        // background tasks, which have already been re-routed to a Flash model above.
+        if background_task_type.is_none() {
+            let rewritten = token_manager
+                .resolve_dynamic_model_for_account(&account_id, &mapped_model)
+                .await;
+            if rewritten != mapped_model {
+                tracing::info!(
+                    "[{}] Claude per-account model rewrite: {} -> {}",
+                    trace_id,
+                    mapped_model,
+                    rewritten
+                );
+                mapped_model = rewritten;
+            }
+        }
+
         request_with_mapped.model = mapped_model.clone();
 
         // 生成 Trace ID (简单用时间戳后缀)

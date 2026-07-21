@@ -45,6 +45,19 @@ fn ensure_gemini_stream_usage(
     has_finish
 }
 
+/// [TRUNCATION FIX] Whether a parsed upstream event carries a genuine completion
+/// marker (`finishReason`). Shared by the native streaming loop and its tests so the
+/// premature-EOF guard uses exactly the detection that is unit-tested. Accepts either
+/// a raw Gemini event or a `{ "response": { ... } }` wrapper.
+fn gemini_event_has_finish_marker(event: &Value) -> bool {
+    let resp = event.get("response").unwrap_or(event);
+    resp.get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .map(|c| c.get("finishReason").is_some() || c.get("finish_reason").is_some())
+        .unwrap_or(false)
+}
+
 /// 处理 generateContent 和 streamGenerateContent
 /// 路径参数: model_name, method (e.g. "gemini-pro", "generateContent")
 pub async fn handle_generate(
@@ -545,12 +558,12 @@ pub async fn handle_generate(
                                                 }
                                             }
 
+                                            if gemini_event_has_finish_marker(&json) {
+                                                saw_completion_marker = true;
+                                            }
                                             if let Some(resp) = json.get("response").or(Some(&json)) {
                                                 if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
                                                     if let Some(candidate) = candidates.first() {
-                                                        if candidate.get("finishReason").is_some() || candidate.get("finish_reason").is_some() {
-                                                            saw_completion_marker = true;
-                                                        }
                                                         if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                             for part in parts {
                                                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -1003,5 +1016,30 @@ mod stream_usage_tests {
         let mut event = json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]});
         assert!(!ensure_gemini_stream_usage(&mut event, 20, 7));
         assert!(event.get("usageMetadata").is_none());
+    }
+
+    // [TRUNCATION FIX] The completion marker is recognised on a finished event, including
+    // through the v1internal `{ "response": { ... } }` wrapper. This backs the guard
+    // that emits an error when a stream ends before a finishReason.
+    #[test]
+    fn detects_finish_marker_on_completed_event() {
+        let finished = json!({"candidates": [{"finishReason": "STOP"}]});
+        assert!(gemini_event_has_finish_marker(&finished));
+
+        let wrapped = json!({"response": {"candidates": [{"finishReason": "STOP"}]}});
+        assert!(gemini_event_has_finish_marker(&wrapped));
+    }
+
+    #[test]
+    fn no_finish_marker_on_partial_event() {
+        // A mid-stream event (the kind a premature EOF would leave as the last packet,
+        // whether or not it had a trailing newline) carries no finishReason, so the
+        // native loop keeps saw_completion_marker=false and surfaces an error.
+        let partial = json!({"candidates": [{"content": {"parts": [{"text": "1\n2\n3"}]}}]});
+        assert!(!gemini_event_has_finish_marker(&partial));
+
+        let wrapped_partial =
+            json!({"response": {"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}});
+        assert!(!gemini_event_has_finish_marker(&wrapped_partial));
     }
 }
