@@ -1965,6 +1965,14 @@ fn build_generation_config(
     // [FIX] Lower default overhead to keep total under 65536
     let final_overhead = if is_adaptive_effective { 64000 } else { 32768 };
 
+    // [FIX 2026-07-22] Claude 系上游自 07-21 起严格校验 maxOutputTokens ≤ 64000
+    // (实测 64000 通过、65536 立刻 400 INVALID_ARGUMENT)
+    let hard_output_limit: u64 = if model_lower.contains("claude") {
+        64000
+    } else {
+        65536
+    };
+
     // [FIX #2007] Opus 4.6 Thinking Alignment
     // OpenAI logs show maxOutputTokens = 57344 (24576 + 32768)
     if model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled {
@@ -1985,7 +1993,7 @@ fn build_generation_config(
                 } else {
                     8192
                 };
-                let boosted = (budget + overhead).min(65536); // [FIX] Never exceed hard limit
+                let boosted = (budget + overhead).min(hard_output_limit); // [FIX] Never exceed hard limit
                 final_max_tokens = Some(boosted as i64);
                 tracing::info!(
                     "[Generation-Config] Bumping maxOutputTokens to {} due to thinking budget of {}", 
@@ -2006,9 +2014,9 @@ fn build_generation_config(
     }
 
     if let Some(val) = final_max_tokens {
-        // [FIX] Cap maxOutputTokens to 65536 to avoid INVALID_ARGUMENT (Cherry Studio sends 128000)
-        // Gemini models typically support max 8192 or 65536 output tokens. 128k is usually invalid.
-        let safe_limit = 65536;
+        // [FIX] Cap maxOutputTokens to hard limit to avoid INVALID_ARGUMENT (Cherry Studio sends 128000)
+        // claude 系上游上限 64000,gemini 系 65536
+        let safe_limit = hard_output_limit as i64;
         if val > safe_limit {
             tracing::warn!(
                 "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
